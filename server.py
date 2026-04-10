@@ -460,6 +460,238 @@ def _set_flags_impl(
         }
 
 
+# --- bulk operation helpers --------------------------------------------------
+
+# Conservative batch size for multi-UID commands. IMAP command line length is
+# implementation-defined but typically capped around 8 KB. With 6-7 digit UIDs
+# and commas, 500 UIDs ≈ 4 KB of command — well under any reasonable limit.
+_BULK_UID_CHUNK = 500
+
+
+def _normalize_uid_list(email_ids: list[str]) -> list[str]:
+    """Validate a list of UIDs and return them as a normalized list of strings.
+
+    Per RFC 3501 §2.3.1.1, UIDs are non-zero 32-bit unsigned integers.
+    """
+    if not email_ids:
+        raise ValueError("email_ids list is empty")
+    out: list[str] = []
+    for u in email_ids:
+        s = str(u).strip()
+        if not s.isdigit() or int(s) == 0:
+            raise ValueError(
+                f"Invalid UID (must be a positive integer, got {u!r})"
+            )
+        out.append(s)
+    return out
+
+
+def _chunk(seq: list[str], n: int):
+    """Yield successive n-sized chunks from seq."""
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
+# --- BODYSTRUCTURE parser ----------------------------------------------------
+#
+# Parses the nested s-expression format from IMAP FETCH BODYSTRUCTURE responses.
+# Tokens: '(', ')', quoted-string, NIL, number, atom.
+#
+# Basic (non-multipart) part fields per RFC 3501 §7.4.2:
+#   type subtype params[=list|NIL] id description encoding size
+#   (+ lines for text/*; + envelope+body+lines for message/rfc822)
+#   md5 disposition language location
+#
+# Multipart: list of child parts + subtype + params + disposition + lang + loc
+
+
+def _tokenize_bodystructure(data: bytes) -> list:
+    """Tokenize an IMAP bodystructure byte string into a flat token list."""
+    tokens: list = []
+    i = 0
+    n = len(data)
+    while i < n:
+        c = data[i : i + 1]
+        if c in (b" ", b"\t", b"\r", b"\n"):
+            i += 1
+            continue
+        if c == b"(":
+            tokens.append("(")
+            i += 1
+            continue
+        if c == b")":
+            tokens.append(")")
+            i += 1
+            continue
+        if c == b'"':
+            # Quoted string
+            j = i + 1
+            buf = bytearray()
+            while j < n:
+                cj = data[j : j + 1]
+                if cj == b"\\" and j + 1 < n:
+                    buf.append(data[j + 1])
+                    j += 2
+                    continue
+                if cj == b'"':
+                    break
+                buf.extend(cj)
+                j += 1
+            tokens.append(bytes(buf).decode("utf-8", errors="replace"))
+            i = j + 1
+            continue
+        # Atom / NIL / number: read until whitespace or paren
+        j = i
+        while j < n and data[j : j + 1] not in (b" ", b"\t", b"\r", b"\n", b"(", b")"):
+            j += 1
+        raw = data[i:j].decode("ascii", errors="replace")
+        if raw.upper() == "NIL":
+            tokens.append(None)
+        else:
+            try:
+                tokens.append(int(raw))
+            except ValueError:
+                tokens.append(raw)
+        i = j
+    return tokens
+
+
+def _parse_bodystructure_list(tokens: list, pos: int):
+    """
+    Recursive-descent parser over the tokens produced by _tokenize_bodystructure.
+    Returns (parsed_tree, next_pos). The parsed tree is the same nested list
+    structure as the original s-expression, with child lists wrapped in Python
+    lists and atoms/strings/numbers/None as leaves.
+    """
+    if pos >= len(tokens):
+        return None, pos
+    tok = tokens[pos]
+    if tok != "(":
+        return tok, pos + 1
+    pos += 1
+    result: list = []
+    while pos < len(tokens) and tokens[pos] != ")":
+        node, pos = _parse_bodystructure_list(tokens, pos)
+        result.append(node)
+    return result, pos + 1  # skip closing ')'
+
+
+def _bodystructure_params_to_dict(params) -> dict:
+    """Convert a parameter list ['key1', 'val1', 'key2', 'val2'] → dict."""
+    if not isinstance(params, list):
+        return {}
+    out: dict = {}
+    for i in range(0, len(params) - 1, 2):
+        k = params[i]
+        v = params[i + 1]
+        if isinstance(k, str):
+            out[k.lower()] = v
+    return out
+
+
+def _walk_bodystructure(tree, part_prefix: str = "") -> list[dict]:
+    """
+    Walk a parsed bodystructure tree and yield a flat list of parts with
+    user-friendly metadata (part number, type, size, filename, etc.).
+
+    Part numbering follows RFC 3501:
+    - single-part message: "1"
+    - multipart/mixed with text + attach: "1", "2"
+    - nested multipart/alternative inside mixed: "1.1", "1.2", "2"
+    """
+    parts: list[dict] = []
+
+    # Multipart: first element is a list (the first child).
+    if isinstance(tree, list) and tree and isinstance(tree[0], list):
+        # Children are at the start; walk until we hit a non-list (the subtype)
+        child_idx = 0
+        for child in tree:
+            if not isinstance(child, list):
+                break
+            child_number = (
+                f"{part_prefix}.{child_idx + 1}" if part_prefix else f"{child_idx + 1}"
+            )
+            parts.extend(_walk_bodystructure(child, child_number))
+            child_idx += 1
+        return parts
+
+    # Single part:
+    # ( type subtype params id desc encoding size [lines] md5 disposition ... )
+    if not isinstance(tree, list) or len(tree) < 7:
+        return parts
+
+    type_ = tree[0] if isinstance(tree[0], str) else "application"
+    subtype = tree[1] if isinstance(tree[1], str) else "octet-stream"
+    params = _bodystructure_params_to_dict(tree[2])
+    size = tree[6] if len(tree) > 6 and isinstance(tree[6], int) else None
+
+    # Disposition is at different indices for text / message-rfc822 / other.
+    # Per RFC 3501 §7.4.2, basic fields are at indices 0-6, then:
+    # text/*         : 7=lines, 8=md5, 9=disposition
+    # message/rfc822 : 7=envelope, 8=body, 9=lines, 10=md5, 11=disposition
+    # everything else: 7=md5, 8=disposition
+    type_lower = type_.lower()
+    subtype_lower = subtype.lower() if isinstance(subtype, str) else ""
+    is_text = type_lower == "text"
+    is_message_rfc822 = type_lower == "message" and subtype_lower == "rfc822"
+    if is_message_rfc822:
+        disp_idx = 11
+    elif is_text:
+        disp_idx = 9
+    else:
+        disp_idx = 8
+
+    filename = None
+    disposition = None
+    if len(tree) > disp_idx and isinstance(tree[disp_idx], list) and tree[disp_idx]:
+        disp_body = tree[disp_idx]
+        if disp_body and isinstance(disp_body[0], str):
+            disposition = disp_body[0].lower()
+        if len(disp_body) > 1:
+            disp_params = _bodystructure_params_to_dict(disp_body[1])
+            filename = disp_params.get("filename")
+
+    if not filename:
+        filename = params.get("name")
+
+    part: dict = {
+        "part": part_prefix or "1",
+        "type": f"{type_}/{subtype}".lower(),
+        "size": size,
+    }
+    if "charset" in params:
+        part["charset"] = params["charset"]
+    if disposition:
+        part["disposition"] = disposition
+    if filename:
+        if isinstance(filename, bytes):
+            filename = filename.decode("utf-8", errors="replace")
+        part["filename"] = decode_mime_header(str(filename))
+
+    parts.append(part)
+    return parts
+
+
+def parse_bodystructure(raw: bytes) -> list[dict]:
+    """Public entrypoint: parse FETCH BODYSTRUCTURE response bytes → part list."""
+    tokens = _tokenize_bodystructure(raw)
+    tree, _ = _parse_bodystructure_list(tokens, 0)
+    if tree is None:
+        return []
+    return _walk_bodystructure(tree)
+
+
+# --- Fwd: prefix dedupe (symmetric to _dedupe_re_prefix) --------------------
+
+_FWD_PREFIX_RE = re.compile(r"^(\s*(?:fwd?|fw)\s*:\s*)+", re.IGNORECASE)
+
+
+def _dedupe_fwd_prefix(subject: str) -> str:
+    """Strip any existing Fwd:/Fw:/FWD: prefixes and add exactly one."""
+    stripped = _FWD_PREFIX_RE.sub("", subject or "").strip()
+    return f"Fwd: {stripped}" if stripped else "Fwd:"
+
+
 @mcp.tool()
 def list_folders() -> list[dict]:
     """
@@ -490,36 +722,77 @@ def list_folders() -> list[dict]:
         return folders
 
 
+# Keywords whose next argument is a free-text value and must be IMAP-quoted
+# (quoted-string form). All are per RFC 3501 §6.4.4.
+_SEARCH_KEYWORDS_STRING_ARG = {
+    "FROM", "TO", "CC", "BCC", "SUBJECT", "BODY", "TEXT",
+}
+
+# Keywords whose next argument is an atom/number/date and must NOT be quoted.
+# RFC 3501 §6.4.4 (SINCE/BEFORE/ON, SENTSINCE/SENTBEFORE/SENTON), RFC 3501
+# SEARCH (LARGER/SMALLER), RFC 3501 KEYWORD/UNKEYWORD (flag atoms).
+_SEARCH_KEYWORDS_ATOM_ARG = {
+    "SINCE", "BEFORE", "ON",
+    "SENTSINCE", "SENTBEFORE", "SENTON",
+    "LARGER", "SMALLER",
+    "KEYWORD", "UNKEYWORD",
+    "UID",
+}
+
+
 def build_imap_search_criteria(query: str) -> list[str]:
     """
     Parse user-friendly query into IMAP search criteria with proper quoting.
 
-    Handles: FROM, TO, CC, BCC, SUBJECT, BODY, TEXT
-    These keywords need their values quoted for IMAP.
+    Supported keywords:
+    - Quoted-string values (auto-quoted):
+      FROM, TO, CC, BCC, SUBJECT, BODY, TEXT
+    - Atom/number/date values (never quoted):
+      SINCE, BEFORE, ON, SENTSINCE, SENTBEFORE, SENTON,
+      LARGER, SMALLER, KEYWORD, UNKEYWORD, UID
+    - Dual-arg (field name + quoted value):
+      HEADER <field> <value>  — e.g. HEADER List-Id "<announce.example>"
+    - Standalone (no args): ALL, UNSEEN, SEEN, ANSWERED, UNANSWERED,
+      FLAGGED, UNFLAGGED, DELETED, UNDELETED, DRAFT, UNDRAFT, NEW, OLD, RECENT
+    - Logical operators (pass-through, consumer writes proper IMAP form):
+      NOT <key>, OR <key1> <key2>, and parenthesized groups (<keys...>)
+
+    Values that already contain quotes in the input are normalized to a
+    single pair of outer double quotes.
     """
-    if not query or query.upper() == "ALL":
+    if not query or query.strip().upper() == "ALL":
         return ["ALL"]
 
-    # Keywords that need their following value quoted
-    keywords_needing_quotes = {"FROM", "TO", "CC", "BCC", "SUBJECT", "BODY", "TEXT"}
-
-    result = []
+    result: list[str] = []
     tokens = query.split()
     i = 0
+
+    def _normalize_quoted(value: str) -> str:
+        """Strip existing outer quotes (single or double) and re-quote."""
+        return f'"{value.strip(chr(34) + chr(39))}"'
 
     while i < len(tokens):
         token = tokens[i]
         upper_token = token.upper()
 
-        if upper_token in keywords_needing_quotes and i + 1 < len(tokens):
-            # This keyword needs the next value quoted
-            value = tokens[i + 1]
-            # Remove existing quotes if any, then add proper quotes
-            value = value.strip('"\'')
+        if upper_token == "HEADER" and i + 2 < len(tokens):
+            # HEADER <field-name> <value>: field is an atom, value is a string.
+            field = tokens[i + 1]
+            value = tokens[i + 2]
+            result.append("HEADER")
+            result.append(field)  # atom — no quoting
+            result.append(_normalize_quoted(value))
+            i += 3
+        elif upper_token in _SEARCH_KEYWORDS_STRING_ARG and i + 1 < len(tokens):
             result.append(upper_token)
-            result.append(f'"{value}"')
+            result.append(_normalize_quoted(tokens[i + 1]))
+            i += 2
+        elif upper_token in _SEARCH_KEYWORDS_ATOM_ARG and i + 1 < len(tokens):
+            result.append(upper_token)
+            result.append(tokens[i + 1])  # atom — no quoting
             i += 2
         else:
+            # Pass-through: ALL/UNSEEN/NOT/OR/(…) and already-formatted tokens
             result.append(token)
             i += 1
 
@@ -1341,6 +1614,798 @@ def reply_email(
         "attachments": attached_names,
         "saved_to_sent": saved,
     }
+
+
+@mcp.tool()
+def forward_email(
+    folder: str,
+    email_id: str,
+    to: str,
+    body: str = "",
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    html: bool = False,
+    attachments: Optional[list[str]] = None,
+    as_attachment: bool = True,
+    save_to_sent: bool = True,
+) -> dict:
+    """
+    Forward an email to new recipients.
+
+    Unlike reply_email, this is a new thread: no In-Reply-To or References
+    headers are set, and the subject gets a deduped "Fwd: " prefix.
+
+    Args:
+        folder: Folder containing the original email
+        email_id: UID of the email to forward
+        to: Forward recipients (comma-separated)
+        body: Optional introduction text prepended to the forwarded content
+        cc: CC recipients (comma-separated)
+        bcc: BCC recipients (comma-separated)
+        html: If True, intro body is HTML (affects inline display only)
+        attachments: Additional files to attach alongside the original
+        as_attachment: If True (default), original message is attached as
+            message/rfc822 (preserves all original headers and structure).
+            If False, headers + body are inlined as quoted text in the body.
+        save_to_sent: If True (default), save a copy to the Sent folder
+    """
+    if not EMAIL:
+        raise ValueError("YANDEX_EMAIL must be set in .env")
+
+    # Fetch the full original message
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        status, msg_data = conn.uid("FETCH", email_id, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            raise Exception(f"Failed to fetch original email: {email_id}")
+
+        raw_original = msg_data[0][1]
+        original = email.message_from_bytes(raw_original)
+
+    original_subject = decode_mime_header(original.get("Subject", ""))
+    forward_subject = _dedupe_fwd_prefix(original_subject)
+
+    if as_attachment:
+        # Build outer multipart/mixed with body + message/rfc822 + extra attachments
+        from email.mime.message import MIMEMessage
+
+        outer = MIMEMultipart("mixed")
+        body_subtype = "html" if html else "plain"
+        outer.attach(MIMEText(body or "", body_subtype, "utf-8"))
+
+        # Attach original as message/rfc822. Sanitize the filename: subject
+        # may contain path separators, quotes, control chars, or be arbitrarily
+        # long — any of these corrupt the Content-Disposition header.
+        safe_subject = re.sub(
+            r'[\\/:*?"<>|\x00-\x1f]', "_", original_subject or "message"
+        ).strip() or "message"
+        safe_subject = safe_subject[:80]
+        rfc822_part = MIMEMessage(original)
+        rfc822_part.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=f"{safe_subject}.eml",
+        )
+        outer.attach(rfc822_part)
+
+        # Additional user-supplied attachments
+        attached_names: list[str] = []
+        for filepath in attachments or []:
+            path = Path(filepath).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Attachment not found: {filepath}")
+            logger.info("forward_email attaching file: %s", path)
+            with open(path, "rb") as f:
+                data = f.read()
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition", "attachment", filename=path.name
+            )
+            outer.attach(part)
+            attached_names.append(path.name)
+
+        outer["Subject"] = forward_subject
+        outer["From"] = EMAIL
+        outer["To"] = to
+        if cc:
+            outer["Cc"] = cc
+        msg = outer
+    else:
+        # Inline: build quoted body with original headers + text
+        orig_from = decode_mime_header(original.get("From", ""))
+        orig_to = decode_mime_header(original.get("To", ""))
+        orig_date = original.get("Date", "")
+        orig_subject = original_subject
+
+        # Extract original plain text body (best effort)
+        orig_body_text = ""
+        if original.is_multipart():
+            for part in original.walk():
+                if part.get_content_type() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        orig_body_text = payload.decode(charset, errors="replace")
+                        break
+        else:
+            payload = original.get_payload(decode=True)
+            if payload:
+                charset = original.get_content_charset() or "utf-8"
+                orig_body_text = payload.decode(charset, errors="replace")
+
+        quoted = "\n".join("> " + line for line in orig_body_text.splitlines())
+        inline_body = (
+            f"{body}\n\n"
+            f"---------- Forwarded message ----------\n"
+            f"From: {orig_from}\n"
+            f"Date: {orig_date}\n"
+            f"Subject: {orig_subject}\n"
+            f"To: {orig_to}\n\n"
+            f"{quoted}"
+        )
+        msg, attached_names = _build_message(
+            to=to,
+            subject=forward_subject,
+            body=inline_body,
+            cc=cc,
+            html=html,
+            attachments=attachments,
+        )
+
+    # Recipients for SMTP envelope
+    recipients = [a.strip() for a in to.split(",") if a.strip()]
+    if cc:
+        recipients.extend(a.strip() for a in cc.split(",") if a.strip())
+    if bcc:
+        recipients.extend(a.strip() for a in bcc.split(",") if a.strip())
+
+    with smtp_connection() as conn:
+        conn.send_message(msg, EMAIL, recipients)
+
+    saved = None
+    if save_to_sent:
+        saved = _save_to_sent_folder(msg)
+
+    return {
+        "status": "sent",
+        "forwarded_to": to,
+        "cc": cc,
+        "subject": forward_subject,
+        "mode": "attachment" if as_attachment else "inline",
+        "extra_attachments": attached_names,
+        "saved_to_sent": saved,
+    }
+
+
+@mcp.tool()
+def bulk_set_flags(
+    folder: str,
+    email_ids: list[str],
+    add: Optional[list[str]] = None,
+    remove: Optional[list[str]] = None,
+) -> dict:
+    """
+    Set or clear IMAP flags on multiple messages in a single operation.
+
+    More efficient than looping set_flags: one UID STORE per chunk of ~500
+    UIDs, not one per message. Validates every flag the same way set_flags
+    does (rejects flags with whitespace, parens, etc.).
+
+    Args:
+        folder: Folder containing the messages
+        email_ids: List of UIDs to update
+        add: Flags to add (e.g. ["\\Seen"])
+        remove: Flags to remove
+
+    Returns count of UIDs touched per add/remove operation.
+    """
+    if not add and not remove:
+        raise ValueError("At least one of add/remove must be non-empty")
+
+    _bad_flag_chars = set(' \t\r\n"\\()[]{}%*')
+    for flag in list(add or []) + list(remove or []):
+        if not flag or not isinstance(flag, str):
+            raise ValueError(f"Invalid flag: {flag!r}")
+        body = flag[1:] if flag.startswith("\\") else flag
+        if not body or any(c in _bad_flag_chars for c in body):
+            raise ValueError(
+                f"Invalid flag {flag!r}: contains reserved IMAP characters"
+            )
+
+    uids = _normalize_uid_list(email_ids)
+
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder))
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        for chunk in _chunk(uids, _BULK_UID_CHUNK):
+            uid_set = ",".join(chunk)
+            if add:
+                flag_list = " ".join(add)
+                status, _ = conn.uid(
+                    "STORE", uid_set, "+FLAGS", f"({flag_list})"
+                )
+                if status != "OK":
+                    raise Exception(
+                        f"bulk_set_flags: failed to add flags {flag_list}"
+                    )
+            if remove:
+                flag_list = " ".join(remove)
+                status, _ = conn.uid(
+                    "STORE", uid_set, "-FLAGS", f"({flag_list})"
+                )
+                if status != "OK":
+                    raise Exception(
+                        f"bulk_set_flags: failed to remove flags {flag_list}"
+                    )
+
+    return {
+        "status": "ok",
+        "folder": folder,
+        "count": len(uids),
+        "added": list(add or []),
+        "removed": list(remove or []),
+    }
+
+
+@mcp.tool()
+def bulk_mark_read(folder: str, email_ids: list[str]) -> dict:
+    """Mark multiple emails as read (adds \\Seen)."""
+    return bulk_set_flags(folder, email_ids, add=["\\Seen"])
+
+
+@mcp.tool()
+def bulk_mark_unread(folder: str, email_ids: list[str]) -> dict:
+    """Mark multiple emails as unread (removes \\Seen)."""
+    return bulk_set_flags(folder, email_ids, remove=["\\Seen"])
+
+
+@mcp.tool()
+def bulk_mark_flagged(
+    folder: str, email_ids: list[str], flagged: bool = True
+) -> dict:
+    """Star or unstar multiple emails via the \\Flagged flag."""
+    if flagged:
+        return bulk_set_flags(folder, email_ids, add=["\\Flagged"])
+    return bulk_set_flags(folder, email_ids, remove=["\\Flagged"])
+
+
+@mcp.tool()
+def bulk_move(
+    folder: str, email_ids: list[str], destination: str
+) -> dict:
+    """
+    Move multiple messages to another folder in a single IMAP session.
+
+    Uses atomic UID MOVE (RFC 6851) in chunks when the server advertises it,
+    falls back to COPY+STORE+EXPUNGE per chunk otherwise.
+    """
+    uids = _normalize_uid_list(email_ids)
+    encoded_source = encode_folder_name(folder)
+    encoded_dest = encode_folder_name(destination)
+    quoted_dest = _quote_folder_for_command(encoded_dest)
+
+    with imap_connection() as conn:
+        status, _ = conn.select(encoded_source)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        use_move = _has_capability(conn, "MOVE")
+        method = "MOVE" if use_move else "COPY+STORE+EXPUNGE"
+
+        for chunk in _chunk(uids, _BULK_UID_CHUNK):
+            uid_set = ",".join(chunk)
+            if use_move:
+                try:
+                    typ, _ = conn._simple_command(
+                        "UID", "MOVE", uid_set, quoted_dest
+                    )
+                    if typ == "OK":
+                        continue
+                    logger.warning(
+                        "bulk_move: UID MOVE returned %s, falling back", typ
+                    )
+                    use_move = False
+                    method = "COPY+STORE+EXPUNGE"
+                except Exception as e:
+                    logger.warning(
+                        "bulk_move: UID MOVE failed, falling back: %s", e
+                    )
+                    use_move = False
+                    method = "COPY+STORE+EXPUNGE"
+
+            # Fallback path (also reached if MOVE flipped mid-loop)
+            status, _ = conn.uid("COPY", uid_set, encoded_dest)
+            if status != "OK":
+                raise Exception(
+                    f"bulk_move: failed to copy chunk to {destination}"
+                )
+            conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+
+        if not use_move:
+            conn.expunge()
+
+    return {
+        "status": "moved",
+        "from_folder": folder,
+        "to_folder": destination,
+        "count": len(uids),
+        "method": method,
+    }
+
+
+@mcp.tool()
+def bulk_delete(
+    folder: str, email_ids: list[str], permanent: bool = False
+) -> dict:
+    """
+    Delete multiple messages at once.
+
+    If permanent=False (default), moves to Trash (discovered via \\Trash
+    SPECIAL-USE with localized fallbacks). If permanent=True or no Trash
+    folder is found, marks +FLAGS \\Deleted and EXPUNGEs immediately.
+
+    Deleting from within the Trash folder is always permanent regardless
+    of the flag.
+    """
+    uids = _normalize_uid_list(email_ids)
+
+    with imap_connection() as conn:
+        trash_folder = _find_trash_folder(conn)
+
+        status, _ = conn.select(encode_folder_name(folder))
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        # If we're already in Trash, or permanent=True, just flag+expunge.
+        folder_key = (
+            decode_folder_name(encode_folder_name(folder)).strip().casefold()
+        )
+        trash_key = decode_folder_name(trash_folder).strip().casefold()
+        force_permanent = permanent or folder_key == trash_key
+
+        if force_permanent:
+            for chunk in _chunk(uids, _BULK_UID_CHUNK):
+                uid_set = ",".join(chunk)
+                status, _ = conn.uid(
+                    "STORE", uid_set, "+FLAGS", "(\\Deleted)"
+                )
+                if status != "OK":
+                    raise Exception("bulk_delete: failed to mark as deleted")
+            conn.expunge()
+            return {
+                "status": "deleted_permanently",
+                "folder": folder,
+                "count": len(uids),
+            }
+
+        # Move to Trash (MOVE if supported, COPY+STORE+EXPUNGE otherwise)
+        encoded_trash = trash_folder
+        quoted_trash = _quote_folder_for_command(encoded_trash)
+        use_move = _has_capability(conn, "MOVE")
+        method = "MOVE" if use_move else "COPY+STORE+EXPUNGE"
+
+        for chunk in _chunk(uids, _BULK_UID_CHUNK):
+            uid_set = ",".join(chunk)
+            if use_move:
+                try:
+                    typ, _ = conn._simple_command(
+                        "UID", "MOVE", uid_set, quoted_trash
+                    )
+                    if typ == "OK":
+                        continue
+                    use_move = False
+                    method = "COPY+STORE+EXPUNGE"
+                except Exception as e:
+                    logger.warning(
+                        "bulk_delete: UID MOVE failed, falling back: %s", e
+                    )
+                    use_move = False
+                    method = "COPY+STORE+EXPUNGE"
+
+            status, _ = conn.uid("COPY", uid_set, encoded_trash)
+            if status != "OK":
+                raise Exception("bulk_delete: failed to copy to trash")
+            conn.uid("STORE", uid_set, "+FLAGS", "(\\Deleted)")
+
+        if not use_move:
+            conn.expunge()
+
+    return {
+        "status": "moved_to_trash",
+        "folder": folder,
+        "trash_folder": decode_folder_name(trash_folder),
+        "count": len(uids),
+        "method": method,
+    }
+
+
+@mcp.tool()
+def inspect_email(folder: str, email_id: str) -> dict:
+    """
+    Inspect an email's headers and MIME structure WITHOUT downloading bodies.
+
+    Uses FETCH BODYSTRUCTURE + header subset — returns in milliseconds even
+    for huge messages with attachments. Ideal for:
+    - Previewing large emails without tying up bandwidth
+    - Deciding which attachment to download (see fetch_part)
+    - Bulk processing many messages efficiently
+
+    Returns subject/from/to/date/size plus a list of MIME parts, each with:
+    - part: part number (e.g. "1", "2", "2.1") — pass to fetch_part
+    - type: MIME type (e.g. "text/plain", "application/pdf")
+    - size: part size in bytes (may be None)
+    - charset: for text parts
+    - filename: for attachments (RFC 2231 / MIME decoded)
+    - disposition: "inline" or "attachment"
+    """
+    fetch_items = (
+        "(RFC822.SIZE BODYSTRUCTURE "
+        "BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO DATE)])"
+    )
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        status, msg_data = conn.uid("FETCH", email_id, fetch_items)
+        if status != "OK" or not msg_data:
+            raise Exception(f"Failed to inspect email: {email_id}")
+
+    # IMAP FETCH response layout for a multi-item request is messy. Each
+    # "literal" section comes back as a tuple (envelope_line, literal_bytes)
+    # where envelope_line tells us which section the literal belongs to.
+    # Non-literal items come back as bare bytes lines.
+    #
+    # We need to tell apart the HEADER.FIELDS literal from a BODYSTRUCTURE
+    # literal (large structures may arrive as literals). The envelope line
+    # for a HEADER.FIELDS literal includes "BODY[HEADER..." or
+    # "BODY[HEADER.FIELDS..."; the BODYSTRUCTURE itself is usually inline
+    # inside the envelope line, but servers may push it as a literal too.
+    header_bytes = b""
+    bodystructure_raw = b""
+    total_size: Optional[int] = None
+
+    def _extract_size(text: str) -> None:
+        nonlocal total_size
+        if total_size is None:
+            m = re.search(r"RFC822\.SIZE\s+(\d+)", text)
+            if m:
+                total_size = int(m.group(1))
+
+    def _extract_inline_bodystructure(env_bytes: bytes) -> bytes:
+        """
+        Pull an inline BODYSTRUCTURE s-expression out of an envelope line.
+
+        Walks the byte stream with a paren-depth counter, skipping parens
+        that live inside quoted strings, so we extract exactly the balanced
+        s-expression and none of the surrounding FETCH response tokens
+        (e.g. a trailing ` BODY[HEADER.FIELDS ...] {N}`).
+        """
+        env_str = env_bytes.decode("utf-8", errors="replace")
+        idx = env_str.upper().find("BODYSTRUCTURE")
+        if idx < 0:
+            return b""
+        paren_idx = env_str.find("(", idx)
+        if paren_idx < 0:
+            return b""
+
+        depth = 0
+        in_quote = False
+        j = paren_idx
+        n = len(env_bytes)
+        while j < n:
+            b = env_bytes[j : j + 1]
+            if in_quote:
+                if b == b"\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if b == b'"':
+                    in_quote = False
+                j += 1
+                continue
+            if b == b'"':
+                in_quote = True
+            elif b == b"(":
+                depth += 1
+            elif b == b")":
+                depth -= 1
+                if depth == 0:
+                    return env_bytes[paren_idx : j + 1]
+            j += 1
+        return b""  # unbalanced — better empty than garbage
+
+    for item in msg_data:
+        if isinstance(item, tuple) and len(item) >= 2:
+            envelope = item[0]
+            payload = item[1]
+            if not isinstance(envelope, (bytes, bytearray)):
+                continue
+            env_str = envelope.decode("utf-8", errors="replace")
+            _extract_size(env_str)
+
+            env_upper = env_str.upper()
+            is_header_literal = (
+                "BODY[HEADER" in env_upper or "BODY.PEEK[HEADER" in env_upper
+            )
+            is_bs_literal = (
+                "BODYSTRUCTURE" in env_upper
+                and not bodystructure_raw
+                and env_str.rstrip().endswith("}")
+                # The envelope ends with a literal-size marker like `{89}`
+                # when the FOLLOWING payload is the literal.
+            )
+
+            if is_header_literal and isinstance(payload, (bytes, bytearray)):
+                header_bytes = bytes(payload)
+            elif is_bs_literal and isinstance(payload, (bytes, bytearray)):
+                bodystructure_raw = bytes(payload)
+            else:
+                # Inline BODYSTRUCTURE inside this envelope line
+                inline = _extract_inline_bodystructure(envelope)
+                if inline and not bodystructure_raw:
+                    bodystructure_raw = inline
+                # Payload here is likely the body of some other section;
+                # if we haven't seen a header literal yet, keep it as a
+                # fallback for the header parse attempt.
+                if isinstance(payload, (bytes, bytearray)) and not header_bytes:
+                    header_bytes = bytes(payload)
+        elif isinstance(item, (bytes, bytearray)):
+            s = item.decode("utf-8", errors="replace")
+            _extract_size(s)
+            if not bodystructure_raw:
+                inline = _extract_inline_bodystructure(bytes(item))
+                if inline:
+                    bodystructure_raw = inline
+
+    msg = email.message_from_bytes(header_bytes) if header_bytes else None
+    subject = decode_mime_header(msg.get("Subject", "")) if msg else ""
+    from_addr = decode_mime_header(msg.get("From", "")) if msg else ""
+    to_addr = decode_mime_header(msg.get("To", "")) if msg else ""
+    date_str = msg.get("Date", "") if msg else ""
+
+    parts = parse_bodystructure(bodystructure_raw) if bodystructure_raw else []
+
+    return {
+        "id": email_id,
+        "subject": subject,
+        "from": from_addr,
+        "to": to_addr,
+        "date": date_str,
+        "size": total_size,
+        "parts": parts,
+    }
+
+
+@mcp.tool()
+def fetch_part(
+    folder: str,
+    email_id: str,
+    part_number: str,
+    decode: bool = True,
+) -> dict:
+    """
+    Fetch a specific MIME part of an email by part number.
+
+    Part numbers come from inspect_email's `parts` list (e.g. "1", "2.1").
+    For text parts with decode=True (default), returns the decoded string
+    body. For binary parts or decode=False, returns base64-encoded bytes
+    so the result is JSON-safe.
+
+    Args:
+        folder: Folder containing the email
+        email_id: UID of the email
+        part_number: Part identifier from inspect_email (e.g. "1", "2.1")
+        decode: If True, decode text parts to str; otherwise return base64
+
+    Returns dict with `content` (str or base64) + `encoding` marker.
+    """
+    import base64
+
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)*", part_number or ""):
+        raise ValueError(f"Invalid part_number: {part_number!r}")
+
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        # Fetch the specific part and its MIME header (for charset)
+        fetch_spec = f"(BODY.PEEK[{part_number}] BODY.PEEK[{part_number}.MIME])"
+        status, msg_data = conn.uid("FETCH", email_id, fetch_spec)
+        if status != "OK" or not msg_data:
+            raise Exception(f"Failed to fetch part {part_number}")
+
+    body_bytes = b""
+    mime_header_bytes = b""
+    for item in msg_data:
+        if isinstance(item, tuple) and len(item) >= 2:
+            envelope = item[0]
+            payload = item[1]
+            if not isinstance(envelope, (bytes, bytearray)) or not isinstance(
+                payload, (bytes, bytearray)
+            ):
+                continue
+            env_str = envelope.decode("utf-8", errors="replace")
+            # envelope contains e.g. "<uid> BODY[1] {123}" or similar
+            if ".MIME" in env_str.upper():
+                mime_header_bytes = bytes(payload)
+            else:
+                body_bytes = bytes(payload)
+
+    # Parse MIME header for encoding + charset
+    encoding_hdr = ""
+    charset = "utf-8"
+    if mime_header_bytes:
+        hdr = email.message_from_bytes(mime_header_bytes)
+        encoding_hdr = (hdr.get("Content-Transfer-Encoding") or "").lower()
+        ctype = hdr.get_content_type() or ""
+        charset = hdr.get_content_charset() or charset
+
+    # Decode transfer encoding
+    payload_bytes = body_bytes
+    if encoding_hdr == "base64":
+        try:
+            payload_bytes = base64.b64decode(body_bytes)
+        except Exception:
+            pass
+    elif encoding_hdr == "quoted-printable":
+        import quopri
+        try:
+            payload_bytes = quopri.decodestring(body_bytes)
+        except Exception:
+            pass
+
+    if decode:
+        try:
+            return {
+                "part": part_number,
+                "encoding": "text",
+                "charset": charset,
+                "content": payload_bytes.decode(charset, errors="replace"),
+                "size": len(payload_bytes),
+            }
+        except Exception:
+            pass
+
+    return {
+        "part": part_number,
+        "encoding": "base64",
+        "content": base64.b64encode(payload_bytes).decode("ascii"),
+        "size": len(payload_bytes),
+    }
+
+
+@mcp.tool()
+def empty_trash() -> dict:
+    """
+    Empty the Trash folder.
+
+    Discovers Trash via \\Trash SPECIAL-USE with localized fallbacks, selects
+    it, marks all messages +FLAGS \\Deleted, and EXPUNGEs. Returns the count
+    of deleted messages.
+    """
+    with imap_connection() as conn:
+        trash = _find_trash_folder(conn)
+        human_name = decode_folder_name(trash)
+
+        status, _ = conn.select(trash)
+        if status != "OK":
+            raise Exception(f"Failed to select Trash folder: {human_name}")
+
+        # Find all UIDs in the trash folder
+        status, data = conn.uid("SEARCH", "ALL")
+        if status != "OK":
+            raise Exception(f"Failed to enumerate Trash contents")
+
+        raw = data[0] if data and data[0] else b""
+        uids = (
+            raw.split() if isinstance(raw, (bytes, bytearray)) else []
+        )
+
+        if not uids:
+            return {
+                "status": "already_empty",
+                "folder": human_name,
+                "deleted": 0,
+            }
+
+        for chunk_bytes in _chunk([u.decode("ascii") for u in uids], _BULK_UID_CHUNK):
+            uid_set = ",".join(chunk_bytes)
+            status, _ = conn.uid(
+                "STORE", uid_set, "+FLAGS", "(\\Deleted)"
+            )
+            if status != "OK":
+                raise Exception("empty_trash: failed to mark as deleted")
+        conn.expunge()
+
+    return {
+        "status": "emptied",
+        "folder": human_name,
+        "deleted": len(uids),
+    }
+
+
+@mcp.tool()
+def get_unread_summary() -> dict:
+    """
+    Get unread and total message counts across ALL selectable folders.
+
+    Iterates LIST, skips \\Noselect folders, calls STATUS on each. Much
+    more efficient than calling get_folder_status per folder from the
+    client side because everything happens in one IMAP session.
+
+    Returns a dict keyed by human-readable folder name, each value
+    containing {messages, unseen}. Also includes a `_summary` key with
+    totals.
+    """
+    result: dict = {}
+    total_unseen = 0
+    total_messages = 0
+    scanned = 0
+
+    with imap_connection() as conn:
+        status, folder_data = conn.list()
+        if status != "OK" or not folder_data:
+            return {"_summary": {"total_unseen": 0, "folders_scanned": 0}}
+
+        for item in folder_data:
+            parsed = _parse_folder_line(item)
+            if parsed is None:
+                continue
+            attrs, imap_name = parsed
+            # Skip non-selectable folders
+            if any(a.lower() == "\\noselect" for a in attrs):
+                continue
+
+            try:
+                # conn.status() is the high-level imaplib method — it applies
+                # its own quoting. Passing a pre-quoted name would corrupt it.
+                status, data = conn.status(imap_name, "(MESSAGES UNSEEN)")
+            except Exception as e:
+                logger.warning("STATUS failed for %s: %s", imap_name, e)
+                continue
+
+            if status != "OK" or not data or not data[0]:
+                continue
+
+            raw = data[0]
+            response = (
+                raw.decode("utf-8", errors="replace")
+                if isinstance(raw, (bytes, bytearray))
+                else str(raw)
+            )
+
+            messages = 0
+            unseen = 0
+            m = re.search(r"MESSAGES\s+(\d+)", response, re.IGNORECASE)
+            if m:
+                messages = int(m.group(1))
+            m = re.search(r"UNSEEN\s+(\d+)", response, re.IGNORECASE)
+            if m:
+                unseen = int(m.group(1))
+
+            human_name = decode_folder_name(imap_name)
+            result[human_name] = {
+                "messages": messages,
+                "unseen": unseen,
+            }
+            total_unseen += unseen
+            total_messages += messages
+            scanned += 1
+
+    result["_summary"] = {
+        "total_unseen": total_unseen,
+        "total_messages": total_messages,
+        "folders_scanned": scanned,
+    }
+    return result
 
 
 if __name__ == "__main__":
