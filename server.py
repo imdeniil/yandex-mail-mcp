@@ -27,14 +27,97 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from imapclient import imap_utf7
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
-# Load environment variables from script's directory
 SCRIPT_DIR = Path(__file__).parent.resolve()
-load_dotenv(SCRIPT_DIR / ".env")
+
+
+def _resolve_dotenv_path() -> Optional[Path]:
+    """
+    Find a .env file in a priority order that works for both
+    direct-invocation and uvx / site-packages installs:
+
+    1. $YANDEX_MAIL_MCP_ENV — explicit override
+    2. $PWD/.env — project-local
+    3. $XDG_CONFIG_HOME/yandex-mail-mcp/.env (or ~/.config/...)
+    4. SCRIPT_DIR/.env — original behavior, only meaningful for source checkouts
+    """
+    override = os.environ.get("YANDEX_MAIL_MCP_ENV")
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+
+    candidates = [
+        Path.cwd() / ".env",
+        Path(
+            os.environ.get(
+                "XDG_CONFIG_HOME", str(Path.home() / ".config")
+            )
+        ) / "yandex-mail-mcp" / ".env",
+        SCRIPT_DIR / ".env",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+_dotenv_path = _resolve_dotenv_path()
+if _dotenv_path is not None:
+    # load_dotenv does NOT override existing env vars by default, so values
+    # set in the MCP client config (e.g. Claude Desktop's `env` key) take
+    # precedence over anything in a .env file.
+    load_dotenv(_dotenv_path)
+
+
+def _resolve_log_file() -> Path:
+    """
+    Choose a log file path that works for both direct-invocation and
+    uvx / site-packages installs.
+
+    1. $YANDEX_MAIL_MCP_LOG_FILE — explicit override
+    2. $XDG_STATE_HOME/yandex-mail-mcp/yandex_mail_mcp.log
+       (or ~/.local/state/yandex-mail-mcp/...)
+    3. SCRIPT_DIR/yandex_mail_mcp.log — if the directory is writable
+       (source checkout scenario)
+    4. $TMPDIR/yandex_mail_mcp.log — last-resort fallback
+    """
+    override = os.environ.get("YANDEX_MAIL_MCP_LOG_FILE")
+    if override:
+        path = Path(override).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    state_home = Path(
+        os.environ.get(
+            "XDG_STATE_HOME", str(Path.home() / ".local" / "state")
+        )
+    )
+    user_log_dir = state_home / "yandex-mail-mcp"
+    try:
+        user_log_dir.mkdir(parents=True, exist_ok=True)
+        return user_log_dir / "yandex_mail_mcp.log"
+    except OSError:
+        pass
+
+    # Source checkout fallback: write next to server.py if possible
+    try:
+        test_path = SCRIPT_DIR / ".write-test"
+        test_path.touch()
+        test_path.unlink()
+        return SCRIPT_DIR / "yandex_mail_mcp.log"
+    except OSError:
+        pass
+
+    return Path(os.environ.get("TMPDIR", "/tmp")) / "yandex_mail_mcp.log"
+
 
 # Configure logging (not print - stdout is for MCP protocol)
-logging.basicConfig(level=logging.INFO, filename=str(SCRIPT_DIR / "yandex_mail_mcp.log"))
+logging.basicConfig(
+    level=logging.INFO,
+    filename=str(_resolve_log_file()),
+)
 logger = logging.getLogger(__name__)
 
 # Yandex server settings
@@ -2457,5 +2540,10 @@ def get_unread_summary() -> dict:
     return result
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the console_scripts `yandex-mail-mcp` command."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

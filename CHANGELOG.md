@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-04-11
+
+Packaging for distribution via `uvx` and proper handling of credentials/logs when the code lives in site-packages rather than next to a user's `.env`.
+
+### Added
+
+- `pyproject.toml` with hatchling build backend, console script entry point `yandex-mail-mcp = "server:main"`, and proper metadata (keywords, classifiers, URLs)
+- `main()` function in `server.py` so it can be used as both a console script and direct `python server.py` invocation
+- Claude Desktop users can now launch via `uvx --from git+https://github.com/imdeniil/yandex-mail-mcp yandex-mail-mcp` with credentials in the MCP client's `env` config block — no clone, no venv, no manual `.env`
+
+### Changed
+
+- **`.env` loading** is no longer hardcoded to `SCRIPT_DIR/.env`. Resolution order is now:
+  1. `$YANDEX_MAIL_MCP_ENV` override
+  2. `$PWD/.env` (project-local)
+  3. `$XDG_CONFIG_HOME/yandex-mail-mcp/.env`
+  4. `SCRIPT_DIR/.env` (source checkouts only)
+
+  Environment variables set in the MCP client config always take precedence because `load_dotenv()` does not override existing `os.environ`.
+
+- **Log file location** is no longer hardcoded to `SCRIPT_DIR/yandex_mail_mcp.log`. Resolution order:
+  1. `$YANDEX_MAIL_MCP_LOG_FILE` override
+  2. `$XDG_STATE_HOME/yandex-mail-mcp/yandex_mail_mcp.log` (typically `~/.local/state/yandex-mail-mcp/`)
+  3. `SCRIPT_DIR` if it's writable (source checkouts)
+  4. `$TMPDIR` last-resort fallback
+
+  This prevents crashes when `server.py` lives in a read-only site-packages directory.
+
+- README restructured around uvx as the recommended install path, with traditional venv/editable install as the alternative for development
+
+### Documentation
+
+- CLAUDE.md: added packaging section, documented the new env/log resolution chains
+- README: new "Quick Start with uvx" section with ready-to-paste Claude Desktop config, explained env var precedence, added "Not supported" section documenting empirically verified Yandex limitations (no ManageSieve, no SORT/THREAD)
+
 ## [0.1.0] - 2026-04-10
 
 Major expansion from 7 to 28 MCP tools, full security audit, UID migration

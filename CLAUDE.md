@@ -9,10 +9,13 @@ MCP (Model Context Protocol) server for Yandex Mail. Provides 28 email tools via
 ## Commands
 
 ```bash
-# Setup
+# Setup (editable install for development)
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
+
+# Alternatively, run as a one-off via uvx without cloning:
+uvx --from git+https://github.com/imdeniil/yandex-mail-mcp yandex-mail-mcp
 
 # Safe tests only — unit tests + read-only integration (default)
 pytest
@@ -58,8 +61,9 @@ Single-file MCP server (`server.py`) using FastMCP framework. 28 `@mcp.tool()` f
 **BODYSTRUCTURE parser**: `_tokenize_bodystructure` → `_parse_bodystructure_list` → `_walk_bodystructure` → `parse_bodystructure` (public). Part number assignment respects RFC 3501 §7.4.2 — including the message/rfc822 special case where disposition is at index 11 (not 8).
 
 **Key implementation details:**
-- `.env` loaded from script directory, not CWD, so MCP clients can launch from anywhere
-- Logging to file (`yandex_mail_mcp.log`) because stdout is reserved for MCP JSON-RPC
+- `.env` resolved with fallback chain: `$YANDEX_MAIL_MCP_ENV` → `$PWD/.env` → `$XDG_CONFIG_HOME/yandex-mail-mcp/.env` → `SCRIPT_DIR/.env`. Env vars from the MCP client (Claude Desktop's `env` config block) always take precedence because `load_dotenv()` does not override existing `os.environ`.
+- Logs go to `$YANDEX_MAIL_MCP_LOG_FILE` > `$XDG_STATE_HOME/yandex-mail-mcp/yandex_mail_mcp.log` > `SCRIPT_DIR` (if writable) > `$TMPDIR`. This makes the package uvx-installable: when running from site-packages, we don't try to write into read-only install dirs.
+- stdout is reserved for MCP JSON-RPC protocol — never `print()`, always log to file
 - All commands use IMAP UIDs (stable) rather than sequence numbers (unstable after EXPUNGE)
 - Non-ASCII search takes a two-phase path: legacy `conn.search()` → seq numbers → UID FETCH translation, because `conn._simple_command` with bytes args concatenates rather than sending literals
 - Atomic `UID MOVE` (RFC 6851) is preferred where capability is advertised, with graceful fallback to `COPY+STORE+EXPUNGE`
@@ -98,6 +102,36 @@ Test isolation: each destructive test uses a unique run_id + UUID and cleans up 
 
 Yandex does NOT implement SORT (RFC 5256) or THREAD. All three variants (`UID SORT`, `UID THREAD REFERENCES`, `UID THREAD ORDEREDSUBJECT`) return `BAD Command syntax error`. Client-side sorting was considered but dropped — if you need sorted results, sort the output of `search_emails` yourself.
 
+## Packaging
+
+Project is packaged via `pyproject.toml` using the hatchling build backend. Single-module layout (`server.py` is the whole thing), with a console script entry point:
+
+```toml
+[project.scripts]
+yandex-mail-mcp = "server:main"
+```
+
+Local testing of the packaged build:
+```bash
+uvx --from . yandex-mail-mcp
+```
+
+Installing as an editable package in your venv:
+```bash
+pip install -e ".[dev]"    # includes pytest
+```
+
+Claude Desktop users launch it via uvx pointing at the git URL (no clone needed):
+```json
+{
+  "command": "uvx",
+  "args": ["--from", "git+https://github.com/imdeniil/yandex-mail-mcp", "yandex-mail-mcp"],
+  "env": { "YANDEX_EMAIL": "...", "YANDEX_APP_PASSWORD": "..." }
+}
+```
+
 ## Release
 
 Use `/version X.Y.Z` command to release a new version. It updates `VERSION` in server.py, creates CHANGELOG.md entry, commits, tags, and pushes.
+
+**Note:** when bumping, also update `version` in `pyproject.toml` to match.
