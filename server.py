@@ -9,6 +9,7 @@ import imaplib
 import smtplib
 import email
 import re
+import socket
 import time
 from email import encoders
 from email.mime.text import MIMEText
@@ -67,13 +68,47 @@ def decode_mime_header(header_value: str) -> str:
     return "".join(decoded_parts)
 
 
+# Transient network errors that are worth retrying a couple of times before
+# giving up. gaierror especially can fire briefly on flaky DNS (WSL2, corporate
+# proxies, home WiFi under load). `time.sleep` backoff is short so end-users
+# don't notice it.
+_TRANSIENT_NET_ERRORS = (
+    socket.gaierror,
+    socket.timeout,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+
+
+def _connect_with_retry(factory, attempts: int = 3, backoff: float = 0.5):
+    """
+    Call `factory()` up to `attempts` times, retrying on transient network
+    errors with a short linear backoff. Re-raises the last error on failure.
+    """
+    last_err: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            return factory()
+        except _TRANSIENT_NET_ERRORS as e:
+            last_err = e
+            if i < attempts - 1:
+                logger.warning(
+                    "Transient network error on attempt %d/%d: %s",
+                    i + 1, attempts, e,
+                )
+                time.sleep(backoff * (i + 1))
+    assert last_err is not None  # for type checker
+    raise last_err
+
+
 @contextmanager
 def imap_connection():
-    """Context manager for IMAP connection."""
+    """Context manager for IMAP connection (with transient-error retry)."""
     if not EMAIL or not PASSWORD:
         raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
 
-    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    conn = _connect_with_retry(lambda: imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT))
     try:
         conn.login(EMAIL, PASSWORD)
         # Explicitly refresh capabilities after auth — some servers only
@@ -94,11 +129,11 @@ def imap_connection():
 
 @contextmanager
 def smtp_connection():
-    """Context manager for SMTP connection."""
+    """Context manager for SMTP connection (with transient-error retry)."""
     if not EMAIL or not PASSWORD:
         raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
 
-    conn = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+    conn = _connect_with_retry(lambda: smtplib.SMTP(SMTP_SERVER, SMTP_PORT))
     try:
         conn.starttls()
         conn.login(EMAIL, PASSWORD)
@@ -752,6 +787,8 @@ def build_imap_search_criteria(query: str) -> list[str]:
       LARGER, SMALLER, KEYWORD, UNKEYWORD, UID
     - Dual-arg (field name + quoted value):
       HEADER <field> <value>  — e.g. HEADER List-Id "<announce.example>"
+      Values containing spaces must be wrapped in double quotes in the
+      input: `HEADER X-Custom "multi word value"`
     - Standalone (no args): ALL, UNSEEN, SEEN, ANSWERED, UNANSWERED,
       FLAGGED, UNFLAGGED, DELETED, UNDELETED, DRAFT, UNDRAFT, NEW, OLD, RECENT
     - Logical operators (pass-through, consumer writes proper IMAP form):
@@ -759,12 +796,24 @@ def build_imap_search_criteria(query: str) -> list[str]:
 
     Values that already contain quotes in the input are normalized to a
     single pair of outer double quotes.
+
+    Tokenization uses shlex to properly honor quoted strings with spaces
+    (e.g. `SUBJECT "hello world"` → `SUBJECT "hello world"`, not broken up).
     """
-    if not query or query.strip().upper() == "ALL":
+    if not query or not query.strip() or query.strip().upper() == "ALL":
+        return ["ALL"]
+
+    import shlex
+    try:
+        tokens = shlex.split(query, posix=True)
+    except ValueError:
+        # Malformed quoting — fall back to naive split
+        tokens = query.split()
+
+    if not tokens:
         return ["ALL"]
 
     result: list[str] = []
-    tokens = query.split()
     i = 0
 
     def _normalize_quoted(value: str) -> str:
