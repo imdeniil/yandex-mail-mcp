@@ -41,12 +41,12 @@ pytest test_helpers.py::TestBodystructureParser -v
 pytest test_integration.py::TestGetFolderStatus::test_has_counts -v
 
 # Test server directly
-python -c "from server import list_folders; print(list_folders())"
+python -c "from yandex_mail_mcp import list_folders; print(list_folders())"
 ```
 
 ## Architecture
 
-Single-file MCP server (`server.py`) using FastMCP framework. 28 `@mcp.tool()` functions + ~18 private helpers.
+Single-file MCP server (`yandex_mail_mcp.py`) using FastMCP framework. 28 `@mcp.tool()` functions + ~18 private helpers. The module is installed via the distribution name `yandex-mail-mcp` on PyPI.
 
 **Tool categories:**
 - **Read**: `list_folders`, `search_emails`, `read_email`, `download_attachment`, `get_folder_status`, `get_unread_summary`, `inspect_email`, `fetch_part`
@@ -104,11 +104,11 @@ Yandex does NOT implement SORT (RFC 5256) or THREAD. All three variants (`UID SO
 
 ## Packaging
 
-Project is packaged via `pyproject.toml` using the hatchling build backend. Single-module layout (`server.py` is the whole thing), with a console script entry point:
+Project is packaged via `pyproject.toml` using the hatchling build backend. Single-module layout (`yandex_mail_mcp.py` is the whole thing), with a console script entry point:
 
 ```toml
 [project.scripts]
-yandex-mail-mcp = "server:main"
+yandex-mail-mcp = "yandex_mail_mcp:main"
 ```
 
 Local testing of the packaged build:
@@ -130,8 +130,77 @@ Claude Desktop users launch it via uvx pointing at the git URL (no clone needed)
 }
 ```
 
+## Publishing to PyPI
+
+### One-time setup
+
+1. **Create PyPI account** at https://pypi.org/account/register/
+2. **Enable 2FA** on the account
+3. **Create a project API token** after first upload (see manual upload below)
+4. **Or: configure Trusted Publishing** at https://pypi.org/manage/account/publishing/ — more secure, no tokens stored anywhere. Register `imdeniil/yandex-mail-mcp` as a publisher with workflow file `.github/workflows/publish.yml` and environment `pypi`. The CI workflow in this repo is already set up for this.
+
+### Manual release workflow
+
+```bash
+# 1. Bump version (edit both)
+vim yandex_mail_mcp.py       # update VERSION = "..."
+vim pyproject.toml           # update version = "..."
+
+# 2. Update CHANGELOG.md with new section
+
+# 3. Commit + tag
+git add yandex_mail_mcp.py pyproject.toml CHANGELOG.md
+git commit -m "chore: Release version X.Y.Z"
+git tag -a vX.Y.Z -m "Release version X.Y.Z"
+
+# 4. Push (triggers CI publish workflow if configured)
+git push origin main
+git push origin vX.Y.Z
+
+# 5. Build artifacts locally (sanity check)
+rm -rf dist/
+uv build
+# → produces dist/yandex_mail_mcp-X.Y.Z.tar.gz and .whl
+
+# 6. Inspect artifacts
+unzip -l dist/yandex_mail_mcp-*.whl
+tar tzf dist/yandex_mail_mcp-*.tar.gz
+
+# 7. (optional) Upload to TestPyPI first
+uv publish --publish-url https://test.pypi.org/legacy/ --token <test-pypi-token>
+# Verify in a clean venv:
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ yandex-mail-mcp
+yandex-mail-mcp --version   # not a real flag, but confirms the script is wired up
+
+# 8. Upload to real PyPI
+uv publish --token <pypi-token>
+# or: python -m twine upload dist/*
+
+# 9. Verify install from PyPI
+uvx yandex-mail-mcp
+```
+
+### Automated release (if GitHub Actions is configured)
+
+Just push a `v*` tag — the workflow at `.github/workflows/publish.yml` triggers automatically, builds, runs smoke tests, and uploads via Trusted Publishing (no tokens needed in secrets).
+
+```bash
+# After editing version files and committing
+git tag -a v0.1.2 -m "Release v0.1.2"
+git push origin main v0.1.2
+# → GitHub Actions picks up the tag, publishes to PyPI
+```
+
+### Version file synchronization
+
+Version lives in two places that must be kept in sync:
+- `yandex_mail_mcp.py`: `VERSION = "X.Y.Z"` — runtime constant, used for logging and debugging
+- `pyproject.toml`: `version = "X.Y.Z"` — package metadata, what PyPI sees
+
+(A future improvement could use `hatch-vcs` or `tool.hatch.version.source = "regex"` to derive pyproject version from the module constant.)
+
 ## Release
 
-Use `/version X.Y.Z` command to release a new version. It updates `VERSION` in server.py, creates CHANGELOG.md entry, commits, tags, and pushes.
+Use `/version X.Y.Z` command to release a new version. It updates `VERSION` in `yandex_mail_mcp.py`, creates CHANGELOG.md entry, commits, tags, and pushes.
 
 **Note:** when bumping, also update `version` in `pyproject.toml` to match.

@@ -8,7 +8,7 @@ No markers — always run.
 
 import pytest
 
-from server import (
+from yandex_mail_mcp import (
     # Extended search parser
     build_imap_search_criteria,
     # BODYSTRUCTURE

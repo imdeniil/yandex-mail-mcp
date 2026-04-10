@@ -21,7 +21,7 @@ import uuid
 
 import pytest
 
-from server import (
+from yandex_mail_mcp import (
     # Reads
     list_folders,
     search_emails,

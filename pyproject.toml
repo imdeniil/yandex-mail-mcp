@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "yandex-mail-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP (Model Context Protocol) server for Yandex Mail via IMAP/SMTP — 28 email tools including search, read, send, reply, forward, bulk operations, and folder management"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,21 +44,22 @@ Issues = "https://github.com/imdeniil/yandex-mail-mcp/issues"
 Changelog = "https://github.com/imdeniil/yandex-mail-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
-yandex-mail-mcp = "server:main"
+yandex-mail-mcp = "yandex_mail_mcp:main"
 
 # --- hatchling build configuration ---------------------------------------
 
 [tool.hatch.build.targets.wheel]
 # Single-file module, not a package
-only-include = ["server.py"]
+only-include = ["yandex_mail_mcp.py"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "server.py",
+    "yandex_mail_mcp.py",
     "README.md",
     "CHANGELOG.md",
     "CLAUDE.md",
     "CLAUDE_DESKTOP.md",
+    "LICENSE",
     ".env.example",
     "pyproject.toml",
 ]

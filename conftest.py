@@ -110,7 +110,7 @@ def sandbox_folder(test_folder_name):
 
     Teardown runs even on test failure.
     """
-    from server import create_folder, delete_folder
+    from yandex_mail_mcp import create_folder, delete_folder
 
     create_folder(test_folder_name)
     try:

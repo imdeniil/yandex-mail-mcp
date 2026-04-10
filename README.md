@@ -20,7 +20,26 @@ All operations use stable IMAP UIDs (not sequence numbers), and connection helpe
 
 ## Quick Start with uvx (recommended)
 
-No install, no venv — `uvx` fetches the package straight from git and runs it sandboxed. Add this to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%/Claude/claude_desktop_config.json` (Windows):
+No install, no venv — `uvx` fetches the package and runs it sandboxed. Add this to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%/Claude/claude_desktop_config.json` (Windows):
+
+### Option 1: From PyPI
+
+```json
+{
+  "mcpServers": {
+    "yandex-mail": {
+      "command": "uvx",
+      "args": ["yandex-mail-mcp"],
+      "env": {
+        "YANDEX_EMAIL": "your-address@yandex.ru",
+        "YANDEX_APP_PASSWORD": "your-app-password-here"
+      }
+    }
+  }
+}
+```
+
+### Option 2: From GitHub (latest development build)
 
 ```json
 {
@@ -97,7 +116,7 @@ The server looks for credentials in this order (first wins):
 2. `$YANDEX_MAIL_MCP_ENV` override path to a `.env` file
 3. `$PWD/.env` (project-local, for direct invocation)
 4. `$XDG_CONFIG_HOME/yandex-mail-mcp/.env` (typically `~/.config/yandex-mail-mcp/.env`)
-5. `.env` next to `server.py` (source checkout)
+5. `.env` next to `yandex_mail_mcp.py` (source checkout)
 
 For Claude Desktop + uvx, just put them in the `env` block of the config as shown above.
 
@@ -107,7 +126,7 @@ The server writes to a log file (stdout is reserved for MCP protocol). Resolutio
 
 1. `$YANDEX_MAIL_MCP_LOG_FILE` override
 2. `$XDG_STATE_HOME/yandex-mail-mcp/yandex_mail_mcp.log` (typically `~/.local/state/yandex-mail-mcp/yandex_mail_mcp.log`)
-3. Next to `server.py` in source checkouts
+3. Next to `yandex_mail_mcp.py` in source checkouts
 4. `$TMPDIR/yandex_mail_mcp.log` last-resort fallback
 
 ## Available Tools

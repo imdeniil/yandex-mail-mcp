@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-04-11
+
+PyPI publication readiness. The core functionality is unchanged; this release
+focuses on making the package distributable via `pip install yandex-mail-mcp`
+without collisions and adding publishing infrastructure.
+
+### Added
+
+- `LICENSE` file (MIT) — PyPI requires this, and it was missing from the
+  original single-file project
+- `.github/workflows/publish.yml` — GitHub Actions workflow that runs unit
+  tests, builds sdist + wheel, validates metadata via `twine check`, and
+  publishes to PyPI on `v*` tag push (or to TestPyPI via workflow_dispatch).
+  Uses PyPI Trusted Publishing (OIDC) — no API token stored in secrets.
+- CLAUDE.md now has a full `Publishing to PyPI` section with one-time setup,
+  manual release workflow, and automated release via the CI workflow
+
+### Changed
+
+**BREAKING (for editable installs / source users):** the top-level module
+has been renamed from `server` to `yandex_mail_mcp`. Users who had:
+
+```python
+from server import list_folders  # old
+```
+
+should update to:
+
+```python
+from yandex_mail_mcp import list_folders  # new
+```
+
+This is required for PyPI publication because `server.py` as a top-level
+module would collide with any other package that ships a `server` module
+in site-packages. The distribution name (`yandex-mail-mcp`) and the uvx
+entry point (`yandex-mail-mcp`) are unchanged.
+
+All test files have been updated to import from `yandex_mail_mcp`.
+`pyproject.toml` entry point is now `yandex-mail-mcp = "yandex_mail_mcp:main"`.
+`only-include` in the wheel target now points at `yandex_mail_mcp.py`.
+
+### Verified
+
+- `uv build` produces clean sdist + wheel
+  (`yandex_mail_mcp-0.1.2.tar.gz` + `yandex_mail_mcp-0.1.2-py3-none-any.whl`)
+- Wheel installed in a clean venv via `pip install dist/*.whl` exposes the
+  `yandex-mail-mcp` console script and can be imported as `yandex_mail_mcp`
+- `uvx --from . yandex-mail-mcp` builds and runs after the rename
+- 124 unit tests pass against the renamed module
+- `yandex-mail-mcp` PyPI name is currently available (checked 2026-04-11)
+
 ## [0.1.1] - 2026-04-11
 
 Packaging for distribution via `uvx` and proper handling of credentials/logs when the code lives in site-packages rather than next to a user's `.env`.
