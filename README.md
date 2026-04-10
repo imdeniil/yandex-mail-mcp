@@ -85,6 +85,19 @@ source .venv/bin/activate
 pytest test_server.py -v
 ```
 
+## Security Notes
+
+- **`send_email` attachments can read any file accessible to the server process.** The `attachments` parameter accepts absolute file paths, so in principle an LLM could be prompt-injected (e.g. via the body of an incoming email read through `read_email`) into attaching sensitive files such as `~/.ssh/id_rsa` to an outgoing message. This is inherent to exposing a filesystem-reading primitive over MCP.
+
+  **Mitigations:**
+  - Every `send_email` call must be approved by you in the MCP client (Claude Desktop shows tool calls before executing them — **always read which files are being attached before approving**).
+  - Every attachment path is written to `yandex_mail_mcp.log` for audit.
+  - Run the server as a user that only has access to files you are willing to send by email.
+
+- **`download_attachment` sanitises filenames** from received email (strips path components, asserts the resolved path stays within `save_dir`) so a malicious sender cannot write outside the target directory.
+
+- **Credentials** (`YANDEX_EMAIL`, `YANDEX_APP_PASSWORD`) are loaded from `.env` in the server's own directory, never from the MCP client's CWD. Keep `.env` out of version control.
+
 ## License
 
 MIT

@@ -8,8 +8,10 @@ Uses IMAP for reading and SMTP for sending.
 import imaplib
 import smtplib
 import email
+from email import encoders
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 import os
@@ -106,6 +108,109 @@ def decode_folder_name(imap_name: str) -> str:
         return imap_name
 
 
+def encode_folder_name(name: str) -> str:
+    """
+    Encode folder name to IMAP modified UTF-7 if it contains non-ASCII.
+
+    Pass-through for ASCII input (including already-encoded UTF-7 like
+    `&BCcENQRABDcENwQwBDw-`), so callers can safely pass either human-readable
+    names ("Корзина") or raw imap_name values from list_folders().
+    """
+    if all(ord(c) < 128 for c in name):
+        return name
+    try:
+        return imap_utf7.encode(name).decode("ascii")
+    except Exception:
+        return name
+
+
+def _parse_folder_line(line) -> Optional[tuple[list[str], str]]:
+    """
+    Parse an IMAP LIST response line into (attrs, imap_name).
+
+    Handles both quoted folder names (`"Trash"`) and unquoted atoms (`INBOX`),
+    and both quoted and NIL hierarchy delimiters. Returns None if the line
+    cannot be parsed.
+    """
+    if not isinstance(line, (bytes, bytearray)):
+        return None
+    decoded = line.decode("utf-8", errors="replace")
+
+    # Attributes list: (\Attr1 \Attr2)
+    if not decoded.startswith("("):
+        return None
+    attrs_end = decoded.find(")")
+    if attrs_end < 0:
+        return None
+    attrs = decoded[1:attrs_end].split()
+
+    rest = decoded[attrs_end + 1 :].strip()
+
+    # Hierarchy delimiter: "/" or NIL
+    if rest.startswith('"'):
+        delim_end = rest.find('"', 1)
+        if delim_end < 0:
+            return None
+        rest = rest[delim_end + 1 :].strip()
+    elif rest[:3].upper() == "NIL":
+        rest = rest[3:].strip()
+    else:
+        return None
+
+    if not rest:
+        return None
+
+    # Mailbox name: quoted string or atom. Strip once more to be robust
+    # against any trailing whitespace or CR the server may have left on.
+    rest = rest.rstrip()
+
+    if rest.startswith('"'):
+        if len(rest) < 2 or not rest.endswith('"'):
+            return None
+        imap_name = rest[1:-1]
+    else:
+        imap_name = rest.split()[0]
+
+    return attrs, imap_name
+
+
+def _find_trash_folder(conn) -> str:
+    """
+    Find the Trash folder via IMAP SPECIAL-USE attribute with fallbacks.
+
+    Preference order:
+    1. Folder with \\Trash special-use attribute (RFC 6154)
+    2. Folder whose decoded name matches Trash/Корзина/Deleted Items
+    3. Literal "Trash" as last resort
+    """
+    try:
+        status, folder_data = conn.list()
+    except Exception:
+        return "Trash"
+
+    if status != "OK" or not folder_data:
+        return "Trash"
+
+    parsed: list[tuple[list[str], str]] = []
+    for item in folder_data:
+        result = _parse_folder_line(item)
+        if result is not None:
+            parsed.append(result)
+
+    # Pass 1: \Trash special-use attribute
+    for attrs, imap_name in parsed:
+        if any(a.lower() == "\\trash" for a in attrs):
+            return imap_name
+
+    # Pass 2: known localized names
+    known = {"trash", "корзина", "deleted items", "deleted messages"}
+    for _attrs, imap_name in parsed:
+        if decode_folder_name(imap_name).strip().casefold() in known:
+            return imap_name
+
+    return "Trash"
+
+
 @mcp.tool()
 def list_folders() -> list[dict]:
     """
@@ -114,6 +219,7 @@ def list_folders() -> list[dict]:
     Returns list of folders with:
     - name: Human-readable folder name (decoded from IMAP UTF-7)
     - imap_name: Raw IMAP folder name (use this for other operations like search_emails)
+    - attrs: IMAP folder attributes, e.g. ["\\HasNoChildren", "\\Trash"]
     """
     with imap_connection() as conn:
         status, folder_data = conn.list()
@@ -122,18 +228,15 @@ def list_folders() -> list[dict]:
 
         folders = []
         for item in folder_data:
-            if isinstance(item, bytes):
-                # Parse folder info: (\\Attr1 \\Attr2) "/" "FolderName"
-                decoded = item.decode("utf-8", errors="replace")
-                # Extract folder name (after last quote pair)
-                parts = decoded.rsplit('"', 2)
-                if len(parts) >= 2:
-                    imap_name = parts[-2]
-                    human_name = decode_folder_name(imap_name)
-                    folders.append({
-                        "name": human_name,
-                        "imap_name": imap_name
-                    })
+            parsed = _parse_folder_line(item)
+            if parsed is None:
+                continue
+            attrs, imap_name = parsed
+            folders.append({
+                "name": decode_folder_name(imap_name),
+                "imap_name": imap_name,
+                "attrs": attrs,
+            })
 
         return folders
 
@@ -178,13 +281,17 @@ def build_imap_search_criteria(query: str) -> list[str]:
 def search_emails(
     folder: str = "INBOX",
     query: str = "ALL",
-    limit: int = 20
+    limit: int = 20,
+    offset: int = 0,
 ) -> list[dict]:
     """
     Search emails in a folder.
 
     Args:
         folder: Mailbox folder (default: INBOX). Use list_folders() to see available folders.
+            Accepts either ASCII names, raw IMAP names from list_folders(), or
+            human-readable non-ASCII names (e.g. "Корзина") — the latter are
+            auto-encoded to IMAP modified UTF-7.
         query: IMAP search query. Examples:
             - "ALL" - all emails
             - "UNSEEN" - unread emails
@@ -194,11 +301,12 @@ def search_emails(
             - "BEFORE 31-Dec-2024" - emails before date
             - Can combine: "UNSEEN FROM boss@company.com"
         limit: Maximum number of emails to return (default: 20)
+        offset: Number of newest-first results to skip, for pagination (default: 0)
 
     Returns list of email summaries with id, subject, from, date.
     """
     with imap_connection() as conn:
-        status, _ = conn.select(folder, readonly=True)
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
@@ -218,9 +326,9 @@ def search_emails(
             raise Exception(f"Search failed: {query}")
 
         ids = message_ids[0].split()
-        # Get most recent emails (last N)
-        ids = ids[-limit:] if len(ids) > limit else ids
-        ids = list(reversed(ids))  # Most recent first
+        # Newest-first, then paginate via offset + limit
+        ids = list(reversed(ids))
+        ids = ids[offset : offset + limit]
 
         emails = []
         for msg_id in ids:
@@ -258,7 +366,7 @@ def read_email(folder: str, email_id: str) -> dict:
     Returns email with subject, from, to, date, body_text, body_html, attachments list.
     """
     with imap_connection() as conn:
-        status, _ = conn.select(folder, readonly=True)
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
@@ -293,19 +401,22 @@ def read_email(folder: str, email_id: str) -> dict:
                         })
                 elif content_type == "text/plain" and not body_text:
                     payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    body_text = payload.decode(charset, errors="replace")
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body_text = payload.decode(charset, errors="replace")
                 elif content_type == "text/html" and not body_html:
                     payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    body_html = payload.decode(charset, errors="replace")
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body_html = payload.decode(charset, errors="replace")
         else:
             payload = msg.get_payload(decode=True)
-            charset = msg.get_content_charset() or "utf-8"
-            if msg.get_content_type() == "text/html":
-                body_html = payload.decode(charset, errors="replace")
-            else:
-                body_text = payload.decode(charset, errors="replace")
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                if msg.get_content_type() == "text/html":
+                    body_html = payload.decode(charset, errors="replace")
+                else:
+                    body_text = payload.decode(charset, errors="replace")
 
         return {
             "id": email_id,
@@ -346,7 +457,7 @@ def download_attachment(
         save_path.mkdir(parents=True, exist_ok=True)
 
     with imap_connection() as conn:
-        status, _ = conn.select(folder, readonly=True)
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
@@ -370,14 +481,32 @@ def download_attachment(
                     # Found the attachment
                     payload = part.get_payload(decode=True)
                     if payload:
-                        # Save to file
-                        file_path = save_path / decoded_filename
+                        # Sanitize: email-provided filenames are untrusted.
+                        # Strip any path components to prevent path traversal
+                        # (e.g. "../../.bashrc" → ".bashrc").
+                        safe_name = Path(decoded_filename).name
+                        if not safe_name or safe_name in (".", ".."):
+                            raise ValueError(
+                                f"Invalid attachment filename: {decoded_filename}"
+                            )
+
+                        save_root = save_path.resolve()
+                        file_path = (save_root / safe_name).resolve()
+
+                        # Defensive: ensure the resolved path stays within save_dir
+                        try:
+                            file_path.relative_to(save_root)
+                        except ValueError:
+                            raise ValueError(
+                                f"Attachment path escapes save directory: {decoded_filename}"
+                            )
+
                         with open(file_path, "wb") as f:
                             f.write(payload)
 
                         return {
                             "status": "downloaded",
-                            "filename": decoded_filename,
+                            "filename": safe_name,
                             "path": str(file_path),
                             "size": len(payload),
                             "content_type": part.get_content_type()
@@ -393,7 +522,8 @@ def send_email(
     body: str,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
-    html: bool = False
+    html: bool = False,
+    attachments: Optional[list[str]] = None,
 ) -> dict:
     """
     Send an email via Yandex SMTP.
@@ -405,13 +535,44 @@ def send_email(
         cc: CC recipients (optional, comma-separated)
         bcc: BCC recipients (optional, comma-separated)
         html: If True, body is treated as HTML (default: False)
+        attachments: Optional list of absolute file paths to attach. Each
+            attachment is resolved and must be a regular file. SECURITY: this
+            tool can read any file accessible to the MCP server process and
+            exfiltrate it via email — the MCP client should surface every
+            send_email call for user approval. All attached paths are logged
+            to yandex_mail_mcp.log for audit.
 
-    Returns confirmation with message ID.
+    Returns confirmation with recipients and attached file names.
     """
     if not EMAIL:
         raise ValueError("YANDEX_EMAIL must be set in .env")
 
-    if html:
+    body_subtype = "html" if html else "plain"
+    attached_names: list[str] = []
+
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(MIMEText(body, body_subtype, "utf-8"))
+        for filepath in attachments:
+            path = Path(filepath).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Attachment not found: {filepath}")
+            logger.info("send_email attaching file: %s", path)
+            with open(path, "rb") as f:
+                data = f.read()
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            # Keyword form of add_header applies RFC 2231 encoding
+            # automatically for non-ASCII filenames.
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=path.name,
+            )
+            msg.attach(part)
+            attached_names.append(path.name)
+    elif html:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body, "html", "utf-8"))
     else:
@@ -438,7 +599,8 @@ def send_email(
         "to": to,
         "subject": subject,
         "cc": cc,
-        "bcc": bcc
+        "bcc": bcc,
+        "attachments": attached_names,
     }
 
 
@@ -454,13 +616,16 @@ def move_email(folder: str, email_id: str, destination: str) -> dict:
 
     Returns confirmation of move.
     """
+    encoded_source = encode_folder_name(folder)
+    encoded_dest = encode_folder_name(destination)
+
     with imap_connection() as conn:
-        status, _ = conn.select(folder)
+        status, _ = conn.select(encoded_source)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
         # Copy to destination
-        status, _ = conn.copy(email_id.encode(), destination)
+        status, _ = conn.copy(email_id.encode(), encoded_dest)
         if status != "OK":
             raise Exception(f"Failed to copy email to: {destination}")
 
@@ -485,42 +650,63 @@ def delete_email(folder: str, email_id: str) -> dict:
     """
     Delete an email (move to Trash).
 
+    Trash folder is discovered via the IMAP \\Trash SPECIAL-USE attribute
+    (RFC 6154) with fallbacks to common localized names. If no trash folder
+    is found or copy fails, the email is permanently deleted.
+
     Args:
         folder: Folder containing the email
         email_id: Email ID to delete
 
     Returns confirmation of deletion.
     """
-    # Yandex uses "Trash" folder (may also be localized)
-    trash_folder = "Trash"
-
     with imap_connection() as conn:
-        status, _ = conn.select(folder)
+        # Resolve trash folder before selecting the source
+        trash_folder = _find_trash_folder(conn)
+
+        status, _ = conn.select(encode_folder_name(folder))
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        # Try to move to Trash
-        status, _ = conn.copy(email_id.encode(), trash_folder)
-        if status != "OK":
-            # If Trash doesn't work, try marking as deleted
-            status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+        # Don't try to copy INTO the folder we're already in. Compare the
+        # decoded human-readable forms with casefold so "trash" == "Trash"
+        # and different but equivalent UTF-7 encodings match.
+        folder_key = decode_folder_name(encode_folder_name(folder)).strip().casefold()
+        trash_key = decode_folder_name(trash_folder).strip().casefold()
+        same_folder = folder_key == trash_key
+
+        if not same_folder:
+            status, _ = conn.copy(email_id.encode(), trash_folder)
             if status != "OK":
-                raise Exception("Failed to delete email")
+                # If Trash copy doesn't work, fall back to permanent delete
+                status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+                if status != "OK":
+                    raise Exception("Failed to delete email")
+                conn.expunge()
+                return {
+                    "status": "deleted_permanently",
+                    "email_id": email_id,
+                    "folder": folder,
+                }
+
+            conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
             conn.expunge()
             return {
-                "status": "deleted_permanently",
+                "status": "moved_to_trash",
                 "email_id": email_id,
-                "folder": folder
+                "folder": folder,
+                "trash_folder": decode_folder_name(trash_folder),
             }
 
-        # Mark original as deleted
-        conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+        # Already in Trash — permanent delete
+        status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+        if status != "OK":
+            raise Exception("Failed to delete email")
         conn.expunge()
-
         return {
-            "status": "moved_to_trash",
+            "status": "deleted_permanently",
             "email_id": email_id,
-            "folder": folder
+            "folder": folder,
         }
 
 
