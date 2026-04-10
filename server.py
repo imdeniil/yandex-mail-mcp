@@ -8,12 +8,14 @@ Uses IMAP for reading and SMTP for sending.
 import imaplib
 import smtplib
 import email
+import re
+import time
 from email import encoders
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, getaddresses, formataddr
 import os
 import sys
 import logging
@@ -74,6 +76,14 @@ def imap_connection():
     conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
     try:
         conn.login(EMAIL, PASSWORD)
+        # Explicitly refresh capabilities after auth — some servers only
+        # advertise extensions like MOVE, SPECIAL-USE or UIDPLUS after
+        # successful LOGIN, and don't include them in the initial greeting
+        # or the LOGIN OK response code.
+        try:
+            conn.capability()
+        except Exception:
+            pass
         yield conn
     finally:
         try:
@@ -211,6 +221,245 @@ def _find_trash_folder(conn) -> str:
     return "Trash"
 
 
+def _find_sent_folder(conn) -> Optional[str]:
+    """
+    Find the Sent folder via IMAP \\Sent SPECIAL-USE (RFC 6154) with fallbacks.
+    Returns None if no suitable folder found.
+    """
+    try:
+        status, folder_data = conn.list()
+    except Exception:
+        return None
+
+    if status != "OK" or not folder_data:
+        return None
+
+    parsed: list[tuple[list[str], str]] = []
+    for item in folder_data:
+        result = _parse_folder_line(item)
+        if result is not None:
+            parsed.append(result)
+
+    # Pass 1: \Sent special-use attribute
+    for attrs, imap_name in parsed:
+        if any(a.lower() == "\\sent" for a in attrs):
+            return imap_name
+
+    # Pass 2: known localized names
+    known = {
+        "sent", "sent items", "sent messages",
+        "отправленные", "отправленные письма", "отправленная почта",
+    }
+    for _attrs, imap_name in parsed:
+        if decode_folder_name(imap_name).strip().casefold() in known:
+            return imap_name
+
+    return None
+
+
+def _has_capability(conn, cap: str) -> bool:
+    """Check if the IMAP server advertises a capability (case-insensitive)."""
+    caps = getattr(conn, "capabilities", None) or ()
+    target = cap.upper()
+    for c in caps:
+        if isinstance(c, bytes):
+            c = c.decode("ascii", errors="ignore")
+        if c.upper() == target:
+            return True
+    return False
+
+
+def _quote_folder_for_command(encoded: str) -> str:
+    """
+    Quote a UTF-7 encoded folder name for use as a raw IMAP command argument.
+
+    imaplib's high-level methods (select, copy, rename, ...) handle quoting
+    internally, but _simple_command passes tokens verbatim. Folder names
+    containing spaces or other non-atom characters must be quoted explicitly
+    so the server parses them as a single mailbox argument.
+    """
+    needs_quote = not encoded or any(
+        c in encoded for c in ' \t"\\()[]{}%*'
+    )
+    if not needs_quote:
+        return encoded
+    escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _build_message(
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    html: bool = False,
+    attachments: Optional[list[str]] = None,
+    extra_headers: Optional[dict] = None,
+):
+    """
+    Build a MIME message for SMTP sending. Shared between send_email and
+    reply_email. Handles plain/HTML bodies, file attachments (with RFC 2231
+    encoding for non-ASCII names), and arbitrary extra headers.
+
+    Returns (msg, attached_names) tuple.
+    """
+    if not EMAIL:
+        raise ValueError("YANDEX_EMAIL must be set in .env")
+
+    body_subtype = "html" if html else "plain"
+    attached_names: list[str] = []
+
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(MIMEText(body, body_subtype, "utf-8"))
+        for filepath in attachments:
+            path = Path(filepath).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Attachment not found: {filepath}")
+            logger.info("send_email attaching file: %s", path)
+            with open(path, "rb") as f:
+                data = f.read()
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            # Keyword form of add_header applies RFC 2231 encoding
+            # automatically for non-ASCII filenames.
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=path.name,
+            )
+            msg.attach(part)
+            attached_names.append(path.name)
+    elif html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
+    msg["Subject"] = subject
+    msg["From"] = EMAIL
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+
+    if extra_headers:
+        for name, value in extra_headers.items():
+            if value:
+                msg[name] = value
+
+    return msg, attached_names
+
+
+def _save_to_sent_folder(msg) -> Optional[str]:
+    """
+    Append a sent message to the Sent folder via IMAP APPEND.
+    Returns the decoded folder name on success, None on any failure
+    (including no Sent folder found — failure is non-fatal).
+    """
+    try:
+        with imap_connection() as conn:
+            sent = _find_sent_folder(conn)
+            if not sent:
+                logger.warning("save_to_sent: no Sent folder found")
+                return None
+
+            date_time = imaplib.Time2Internaldate(time.time())
+            message_bytes = msg.as_bytes()
+
+            status, _ = conn.append(sent, "\\Seen", date_time, message_bytes)
+            if status != "OK":
+                logger.warning("save_to_sent: APPEND failed with status %s", status)
+                return None
+
+            return decode_folder_name(sent)
+    except Exception as e:
+        logger.warning("save_to_sent: unexpected error: %s", e)
+        return None
+
+
+_RE_PREFIX_RE = re.compile(r"^(\s*re\s*:\s*)+", re.IGNORECASE)
+
+
+def _dedupe_re_prefix(subject: str) -> str:
+    """Strip any existing Re:/RE:/re: prefixes and add exactly one."""
+    stripped = _RE_PREFIX_RE.sub("", subject or "").strip()
+    return f"Re: {stripped}" if stripped else "Re:"
+
+
+def _trim_references(refs: str, max_ids: int = 10, max_bytes: int = 998) -> str:
+    """
+    Trim a References header to stay under common length limits.
+    Preserves the thread root (first ID) and most recent entries.
+    """
+    ids = (refs or "").split()
+    if not ids:
+        return ""
+    if len(ids) > max_ids:
+        ids = [ids[0]] + ids[-(max_ids - 1) :]
+    result = " ".join(ids)
+    while len(result.encode("utf-8", errors="replace")) > max_bytes and len(ids) > 2:
+        ids.pop(1)  # drop second-oldest, keep root + recent
+        result = " ".join(ids)
+    return result
+
+
+def _set_flags_impl(
+    folder: str,
+    email_id: str,
+    add: Optional[list[str]] = None,
+    remove: Optional[list[str]] = None,
+) -> dict:
+    """Internal implementation of flag manipulation via UID STORE."""
+    if not add and not remove:
+        raise ValueError("At least one of add/remove must be non-empty")
+
+    # Guard against flag strings that would corrupt IMAP STORE syntax.
+    # IMAP flags are either system flags (\Seen, \Flagged, ...) or keywords
+    # (atoms per RFC 3501): no whitespace, parens, quotes, braces, percent,
+    # asterisk, or non-printable characters.
+    _bad_flag_chars = set(' \t\r\n"\\()[]{}%*')
+    for flag in list(add or []) + list(remove or []):
+        if not flag or not isinstance(flag, str):
+            raise ValueError(f"Invalid flag: {flag!r}")
+        # Allow leading backslash for system flags (\Seen etc.) but reject
+        # backslash elsewhere or as part of the character set above.
+        body = flag[1:] if flag.startswith("\\") else flag
+        if not body or any(c in _bad_flag_chars for c in body):
+            raise ValueError(
+                f"Invalid flag {flag!r}: contains reserved IMAP characters"
+            )
+
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder))
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        if add:
+            flag_list = " ".join(add)
+            status, _ = conn.uid(
+                "STORE", email_id, "+FLAGS", f"({flag_list})"
+            )
+            if status != "OK":
+                raise Exception(f"Failed to add flags: {flag_list}")
+
+        if remove:
+            flag_list = " ".join(remove)
+            status, _ = conn.uid(
+                "STORE", email_id, "-FLAGS", f"({flag_list})"
+            )
+            if status != "OK":
+                raise Exception(f"Failed to remove flags: {flag_list}")
+
+        return {
+            "status": "ok",
+            "email_id": email_id,
+            "folder": folder,
+            "added": list(add or []),
+            "removed": list(remove or []),
+        }
+
+
 @mcp.tool()
 def list_folders() -> list[dict]:
     """
@@ -287,6 +536,9 @@ def search_emails(
     """
     Search emails in a folder.
 
+    IDs returned are IMAP UIDs (stable within a folder's UIDVALIDITY), not
+    sequence numbers — they will not change after other messages are deleted.
+
     Args:
         folder: Mailbox folder (default: INBOX). Use list_folders() to see available folders.
             Accepts either ASCII names, raw IMAP names from list_folders(), or
@@ -303,7 +555,7 @@ def search_emails(
         limit: Maximum number of emails to return (default: 20)
         offset: Number of newest-first results to skip, for pagination (default: 0)
 
-    Returns list of email summaries with id, subject, from, date.
+    Returns list of email summaries with id (UID), subject, from, date.
     """
     with imap_connection() as conn:
         status, _ = conn.select(encode_folder_name(folder), readonly=True)
@@ -316,25 +568,97 @@ def search_emails(
         # Use UTF-8 charset for non-ASCII queries (Cyrillic, etc.)
         has_non_ascii = any(ord(c) > 127 for c in query)
         if has_non_ascii:
-            # For UTF-8 search, we need to pass criteria as a single string
+            # UID SEARCH with CHARSET: do a legacy (sequence-number) SEARCH
+            # via conn.search() which uses imaplib's own charset handling,
+            # then translate the returned sequence numbers to UIDs via UID
+            # FETCH (UID). This keeps the tool's public contract (UIDs) while
+            # avoiding the private _simple_command path for the charset case.
+            #
+            # Note: conn.search/_simple_command concatenates bytes args raw
+            # into the command stream (they are NOT sent as RFC 3501 literals
+            # — the literal mechanism uses the conn.literal attribute, which
+            # only supports one literal as the last arg). We rely on Yandex
+            # being lenient about UTF-8 bytes inside quoted strings, same as
+            # the pre-fix code did.
             criteria_str = " ".join(criteria)
-            status, message_ids = conn.search("UTF-8", criteria_str.encode("utf-8"))
+            status, seq_data = conn.search("UTF-8", criteria_str.encode("utf-8"))
+            if status != "OK":
+                raise Exception(f"Search failed: {query}")
+
+            raw_seqs = seq_data[0] if seq_data and seq_data[0] else b""
+            seq_ids = (
+                raw_seqs.split()
+                if isinstance(raw_seqs, (bytes, bytearray))
+                else []
+            )
+
+            if not seq_ids:
+                return []
+
+            # Translate sequence numbers → UIDs via one FETCH round-trip
+            seq_set = b",".join(seq_ids).decode("ascii")
+            status, uid_data = conn.fetch(seq_set, "(UID)")
+            if status != "OK":
+                raise Exception("Failed to translate seq numbers to UIDs")
+
+            seq_to_uid: dict[str, str] = {}
+            for item in uid_data or []:
+                if not isinstance(item, (bytes, bytearray)):
+                    continue
+                line = item.decode("ascii", errors="ignore")
+                # Format varies by imaplib version and response shape:
+                #   "5 (UID 1023)"
+                #   "* 5 FETCH (UID 1023)"
+                #   "5 (UID 1023 FLAGS (\\Seen))"
+                # Tokenize after removing parens and find UID by label,
+                # not by positional index.
+                tokens = line.replace("(", " ").replace(")", " ").split()
+                upper = [t.upper() for t in tokens]
+                if "UID" not in upper:
+                    continue
+                uid_idx = upper.index("UID")
+                if uid_idx + 1 >= len(tokens):
+                    continue
+                # First numeric token is the sequence number
+                seq_token = next(
+                    (t for t in tokens if t.isdigit()), None
+                )
+                if seq_token is None:
+                    continue
+                seq_to_uid[seq_token] = tokens[uid_idx + 1]
+
+            # Preserve original search order
+            ids = [
+                seq_to_uid[s.decode("ascii")].encode("ascii")
+                for s in seq_ids
+                if s.decode("ascii") in seq_to_uid
+            ]
+            # Short-circuit the common post-processing path below
+            message_ids = [b" ".join(ids)]
         else:
-            status, message_ids = conn.search(None, *criteria)
+            status, message_ids = conn.uid("SEARCH", *criteria)
 
         if status != "OK":
             raise Exception(f"Search failed: {query}")
 
-        ids = message_ids[0].split()
+        # message_ids[0] may be None if the response had no SEARCH line
+        raw_ids = message_ids[0] if message_ids and message_ids[0] else b""
+        ids = raw_ids.split() if isinstance(raw_ids, (bytes, bytearray)) else []
+
         # Newest-first, then paginate via offset + limit
         ids = list(reversed(ids))
         ids = ids[offset : offset + limit]
 
         emails = []
-        for msg_id in ids:
+        for uid_bytes in ids:
+            uid_str = uid_bytes.decode("ascii") if isinstance(uid_bytes, (bytes, bytearray)) else str(uid_bytes)
             # Fetch headers only for performance
-            status, msg_data = conn.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
-            if status != "OK":
+            status, msg_data = conn.uid(
+                "FETCH",
+                uid_str,
+                "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])",
+            )
+            if status != "OK" or not msg_data or not msg_data[0]:
                 continue
 
             raw_header = msg_data[0][1]
@@ -345,10 +669,10 @@ def search_emails(
             date_str = msg.get("Date", "")
 
             emails.append({
-                "id": msg_id.decode("utf-8"),
+                "id": uid_str,
                 "subject": subject,
                 "from": from_addr,
-                "date": date_str
+                "date": date_str,
             })
 
         return emails
@@ -370,8 +694,8 @@ def read_email(folder: str, email_id: str) -> dict:
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        status, msg_data = conn.fetch(email_id.encode(), "(RFC822)")
-        if status != "OK":
+        status, msg_data = conn.uid("FETCH", email_id, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
             raise Exception(f"Failed to fetch email: {email_id}")
 
         raw_email = msg_data[0][1]
@@ -461,8 +785,8 @@ def download_attachment(
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        status, msg_data = conn.fetch(email_id.encode(), "(RFC822)")
-        if status != "OK":
+        status, msg_data = conn.uid("FETCH", email_id, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
             raise Exception(f"Failed to fetch email: {email_id}")
 
         raw_email = msg_data[0][1]
@@ -524,6 +848,7 @@ def send_email(
     bcc: Optional[str] = None,
     html: bool = False,
     attachments: Optional[list[str]] = None,
+    save_to_sent: bool = True,
 ) -> dict:
     """
     Send an email via Yandex SMTP.
@@ -541,50 +866,24 @@ def send_email(
             exfiltrate it via email — the MCP client should surface every
             send_email call for user approval. All attached paths are logged
             to yandex_mail_mcp.log for audit.
+        save_to_sent: If True (default), append a copy of the sent message to
+            the Sent folder via IMAP APPEND. Yandex does not reliably auto-save
+            SMTP-sent messages to Sent; this ensures a copy exists. Failure to
+            save is non-fatal and logged as a warning.
 
-    Returns confirmation with recipients and attached file names.
+    Returns confirmation with recipients, attached file names, and
+    saved_to_sent (decoded Sent folder name or None).
     """
-    if not EMAIL:
-        raise ValueError("YANDEX_EMAIL must be set in .env")
+    msg, attached_names = _build_message(
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        html=html,
+        attachments=attachments,
+    )
 
-    body_subtype = "html" if html else "plain"
-    attached_names: list[str] = []
-
-    if attachments:
-        msg = MIMEMultipart("mixed")
-        msg.attach(MIMEText(body, body_subtype, "utf-8"))
-        for filepath in attachments:
-            path = Path(filepath).expanduser().resolve()
-            if not path.is_file():
-                raise FileNotFoundError(f"Attachment not found: {filepath}")
-            logger.info("send_email attaching file: %s", path)
-            with open(path, "rb") as f:
-                data = f.read()
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(data)
-            encoders.encode_base64(part)
-            # Keyword form of add_header applies RFC 2231 encoding
-            # automatically for non-ASCII filenames.
-            part.add_header(
-                "Content-Disposition",
-                "attachment",
-                filename=path.name,
-            )
-            msg.attach(part)
-            attached_names.append(path.name)
-    elif html:
-        msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(body, "html", "utf-8"))
-    else:
-        msg = MIMEText(body, "plain", "utf-8")
-
-    msg["Subject"] = subject
-    msg["From"] = EMAIL
-    msg["To"] = to
-    if cc:
-        msg["Cc"] = cc
-
-    # Build recipient list
+    # Build recipient list for the SMTP envelope
     recipients = [addr.strip() for addr in to.split(",")]
     if cc:
         recipients.extend([addr.strip() for addr in cc.split(",")])
@@ -594,6 +893,10 @@ def send_email(
     with smtp_connection() as conn:
         conn.send_message(msg, EMAIL, recipients)
 
+    saved = None
+    if save_to_sent:
+        saved = _save_to_sent_folder(msg)
+
     return {
         "status": "sent",
         "to": to,
@@ -601,6 +904,7 @@ def send_email(
         "cc": cc,
         "bcc": bcc,
         "attachments": attached_names,
+        "saved_to_sent": saved,
     }
 
 
@@ -624,24 +928,44 @@ def move_email(folder: str, email_id: str, destination: str) -> dict:
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        # Copy to destination
-        status, _ = conn.copy(email_id.encode(), encoded_dest)
+        # Prefer atomic UID MOVE (RFC 6851) when the server advertises it.
+        if _has_capability(conn, "MOVE"):
+            try:
+                typ, _ = conn._simple_command(
+                    "UID", "MOVE", email_id,
+                    _quote_folder_for_command(encoded_dest),
+                )
+                if typ == "OK":
+                    return {
+                        "status": "moved",
+                        "email_id": email_id,
+                        "from_folder": folder,
+                        "to_folder": destination,
+                        "method": "MOVE",
+                    }
+                logger.warning(
+                    "UID MOVE returned %s, falling back to COPY+STORE", typ
+                )
+            except Exception as e:
+                logger.warning("UID MOVE failed, falling back to COPY: %s", e)
+
+        # Fallback: COPY → +FLAGS \Deleted → EXPUNGE
+        status, _ = conn.uid("COPY", email_id, encoded_dest)
         if status != "OK":
             raise Exception(f"Failed to copy email to: {destination}")
 
-        # Mark original as deleted
-        status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+        status, _ = conn.uid("STORE", email_id, "+FLAGS", "\\Deleted")
         if status != "OK":
             raise Exception("Failed to mark original as deleted")
 
-        # Expunge to actually delete
         conn.expunge()
 
         return {
             "status": "moved",
             "email_id": email_id,
             "from_folder": folder,
-            "to_folder": destination
+            "to_folder": destination,
+            "method": "COPY+STORE+EXPUNGE",
         }
 
 
@@ -676,10 +1000,34 @@ def delete_email(folder: str, email_id: str) -> dict:
         same_folder = folder_key == trash_key
 
         if not same_folder:
-            status, _ = conn.copy(email_id.encode(), trash_folder)
+            # Try atomic MOVE extension first
+            if _has_capability(conn, "MOVE"):
+                try:
+                    typ, _ = conn._simple_command(
+                        "UID", "MOVE", email_id,
+                        _quote_folder_for_command(trash_folder),
+                    )
+                    if typ == "OK":
+                        return {
+                            "status": "moved_to_trash",
+                            "email_id": email_id,
+                            "folder": folder,
+                            "trash_folder": decode_folder_name(trash_folder),
+                            "method": "MOVE",
+                        }
+                    logger.warning(
+                        "UID MOVE to trash returned %s, falling back", typ
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "UID MOVE to trash failed, falling back: %s", e
+                    )
+
+            # Fallback: COPY → +FLAGS \Deleted → EXPUNGE
+            status, _ = conn.uid("COPY", email_id, trash_folder)
             if status != "OK":
-                # If Trash copy doesn't work, fall back to permanent delete
-                status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+                # Trash copy failed — fall through to permanent delete
+                status, _ = conn.uid("STORE", email_id, "+FLAGS", "\\Deleted")
                 if status != "OK":
                     raise Exception("Failed to delete email")
                 conn.expunge()
@@ -689,17 +1037,18 @@ def delete_email(folder: str, email_id: str) -> dict:
                     "folder": folder,
                 }
 
-            conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+            conn.uid("STORE", email_id, "+FLAGS", "\\Deleted")
             conn.expunge()
             return {
                 "status": "moved_to_trash",
                 "email_id": email_id,
                 "folder": folder,
                 "trash_folder": decode_folder_name(trash_folder),
+                "method": "COPY+STORE+EXPUNGE",
             }
 
         # Already in Trash — permanent delete
-        status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+        status, _ = conn.uid("STORE", email_id, "+FLAGS", "\\Deleted")
         if status != "OK":
             raise Exception("Failed to delete email")
         conn.expunge()
@@ -708,6 +1057,290 @@ def delete_email(folder: str, email_id: str) -> dict:
             "email_id": email_id,
             "folder": folder,
         }
+
+
+@mcp.tool()
+def set_flags(
+    folder: str,
+    email_id: str,
+    add: Optional[list[str]] = None,
+    remove: Optional[list[str]] = None,
+) -> dict:
+    """
+    Set or clear IMAP flags on a message.
+
+    Common IMAP system flags (backslash-prefixed): \\Seen, \\Flagged,
+    \\Answered, \\Draft, \\Deleted. Custom user keywords have no backslash.
+
+    Args:
+        folder: Folder containing the email
+        email_id: UID of the email (from search_emails result)
+        add: Flags to add (e.g. ["\\Seen", "\\Flagged"])
+        remove: Flags to remove
+
+    Returns confirmation with the flags added/removed.
+    """
+    return _set_flags_impl(folder, email_id, add=add, remove=remove)
+
+
+@mcp.tool()
+def mark_read(folder: str, email_id: str) -> dict:
+    """Mark an email as read (adds \\Seen)."""
+    return _set_flags_impl(folder, email_id, add=["\\Seen"])
+
+
+@mcp.tool()
+def mark_unread(folder: str, email_id: str) -> dict:
+    """Mark an email as unread (removes \\Seen)."""
+    return _set_flags_impl(folder, email_id, remove=["\\Seen"])
+
+
+@mcp.tool()
+def mark_flagged(folder: str, email_id: str, flagged: bool = True) -> dict:
+    """Star or unstar an email via the \\Flagged IMAP flag."""
+    if flagged:
+        return _set_flags_impl(folder, email_id, add=["\\Flagged"])
+    return _set_flags_impl(folder, email_id, remove=["\\Flagged"])
+
+
+@mcp.tool()
+def mark_answered(folder: str, email_id: str) -> dict:
+    """Mark an email as answered (adds \\Answered)."""
+    return _set_flags_impl(folder, email_id, add=["\\Answered"])
+
+
+@mcp.tool()
+def get_folder_status(folder: str) -> dict:
+    """
+    Get counts and state for a folder via IMAP STATUS (RFC 3501).
+
+    Returns dict with keys (when available):
+    - folder: input folder name
+    - messages: total messages
+    - unseen: unread messages
+    - recent: recent messages
+    - uidnext: next UID to be assigned
+    - uidvalidity: UID validity identifier (if this changes, stored UIDs
+      are no longer valid and must be re-fetched)
+    """
+    items = "(MESSAGES UNSEEN RECENT UIDNEXT UIDVALIDITY)"
+    with imap_connection() as conn:
+        status, data = conn.status(encode_folder_name(folder), items)
+        if status != "OK":
+            raise Exception(f"Failed to get status for: {folder}")
+
+        result: dict = {"folder": folder}
+
+        if not data or not data[0]:
+            return result
+
+        raw = data[0]
+        if isinstance(raw, (bytes, bytearray)):
+            response = raw.decode("utf-8", errors="replace")
+        else:
+            response = str(raw)
+
+        # Format: "FolderName" (KEY1 val1 KEY2 val2 ...)
+        start = response.find("(")
+        end = response.rfind(")")
+        if start < 0 or end < 0 or end <= start:
+            return result
+
+        parts = response[start + 1 : end].split()
+        for i in range(0, len(parts) - 1, 2):
+            key = parts[i].lower()
+            value_token = parts[i + 1]
+            try:
+                result[key] = int(value_token)
+            except ValueError:
+                result[key] = value_token
+
+        return result
+
+
+@mcp.tool()
+def create_folder(name: str) -> dict:
+    """
+    Create a new mail folder. Name can be human-readable (Cyrillic supported —
+    auto-encoded to IMAP modified UTF-7).
+    """
+    with imap_connection() as conn:
+        status, _ = conn.create(encode_folder_name(name))
+        if status != "OK":
+            raise Exception(f"Failed to create folder: {name}")
+        return {"status": "created", "folder": name}
+
+
+@mcp.tool()
+def rename_folder(old_name: str, new_name: str) -> dict:
+    """Rename a mail folder. Both names are auto-encoded to UTF-7."""
+    with imap_connection() as conn:
+        status, _ = conn.rename(
+            encode_folder_name(old_name),
+            encode_folder_name(new_name),
+        )
+        if status != "OK":
+            raise Exception(
+                f"Failed to rename folder: {old_name} → {new_name}"
+            )
+        return {
+            "status": "renamed",
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+
+
+@mcp.tool()
+def delete_folder(name: str) -> dict:
+    """
+    Delete a mail folder.
+
+    WARNING: This is destructive. Behavior on non-empty folders is
+    server-dependent (RFC 3501 §6.3.4 permits servers to return NO);
+    some servers reject the operation, others delete the contents
+    without moving them to Trash. The MCP client should surface this
+    call for user approval.
+    """
+    with imap_connection() as conn:
+        status, _ = conn.delete(encode_folder_name(name))
+        if status != "OK":
+            raise Exception(f"Failed to delete folder: {name}")
+        return {"status": "deleted", "folder": name}
+
+
+@mcp.tool()
+def reply_email(
+    folder: str,
+    email_id: str,
+    body: str,
+    reply_all: bool = False,
+    html: bool = False,
+    attachments: Optional[list[str]] = None,
+    save_to_sent: bool = True,
+) -> dict:
+    """
+    Reply to an email with correct threading headers (RFC 5322).
+
+    Fetches the original message's Message-ID, References, Subject, From,
+    Reply-To, To and Cc headers, and builds a reply with:
+    - `In-Reply-To` pointing at the original Message-ID
+    - `References` chaining the previous thread plus the original Message-ID
+    - `Subject` with a deduped "Re: " prefix
+    - Recipients: original Reply-To (or From); if reply_all, also original
+      To + Cc with our own address removed
+
+    Args:
+        folder: Folder containing the original email
+        email_id: UID of the email to reply to
+        body: Reply body text (plain or HTML)
+        reply_all: If True, include original To + Cc recipients
+        html: If True, body is HTML
+        attachments: Optional list of file paths to attach
+        save_to_sent: If True (default), save the reply to the Sent folder
+    """
+    if not EMAIL:
+        raise ValueError("YANDEX_EMAIL must be set in .env")
+
+    # Fetch original's threading headers in a single small request
+    with imap_connection() as conn:
+        status, _ = conn.select(encode_folder_name(folder), readonly=True)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        status, msg_data = conn.uid(
+            "FETCH",
+            email_id,
+            "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES SUBJECT FROM REPLY-TO TO CC)])",
+        )
+        if status != "OK" or not msg_data or not msg_data[0]:
+            raise Exception(f"Failed to fetch original email: {email_id}")
+
+        raw = msg_data[0][1]
+        original = email.message_from_bytes(raw)
+
+    original_msg_id = (original.get("Message-ID") or "").strip()
+    original_refs = (original.get("References") or "").strip()
+    original_subject = decode_mime_header(original.get("Subject", ""))
+    reply_to_header = original.get("Reply-To") or original.get("From") or ""
+    original_to = original.get("To", "")
+    original_cc = original.get("Cc", "")
+
+    # Reply recipients
+    to_addr = reply_to_header
+    cc_addr: Optional[str] = None
+    if reply_all:
+        # Parse original To + Cc as proper RFC 5322 address lists. getaddresses
+        # correctly handles display names with commas, quoted-printable encoding
+        # and multiple addresses per header.
+        all_addrs: list[tuple[str, str]] = list(
+            getaddresses([original_to, original_cc])
+        )
+        own = (EMAIL or "").lower()
+        filtered: list[str] = []
+        for display_name, bare_addr in all_addrs:
+            if not bare_addr:
+                continue
+            # Exact address match, case-insensitive
+            if bare_addr.lower() == own:
+                continue
+            filtered.append(formataddr((display_name, bare_addr)))
+        if filtered:
+            cc_addr = ", ".join(filtered)
+
+    # Threading headers
+    extra_headers: dict = {}
+    if original_msg_id:
+        extra_headers["In-Reply-To"] = original_msg_id
+        chained = (
+            f"{original_refs} {original_msg_id}".strip()
+            if original_refs
+            else original_msg_id
+        )
+        extra_headers["References"] = _trim_references(chained)
+    else:
+        logger.warning(
+            "reply_email: original %s has no Message-ID, thread will break",
+            email_id,
+        )
+
+    reply_subject = _dedupe_re_prefix(original_subject)
+
+    msg, attached_names = _build_message(
+        to=to_addr,
+        subject=reply_subject,
+        body=body,
+        cc=cc_addr,
+        html=html,
+        attachments=attachments,
+        extra_headers=extra_headers,
+    )
+
+    recipients = [a.strip() for a in to_addr.split(",") if a.strip()]
+    if cc_addr:
+        recipients.extend(a.strip() for a in cc_addr.split(",") if a.strip())
+
+    with smtp_connection() as conn:
+        conn.send_message(msg, EMAIL, recipients)
+
+    # Also mark the original as answered (best-effort; failure is non-fatal)
+    try:
+        _set_flags_impl(folder, email_id, add=["\\Answered"])
+    except Exception as e:
+        logger.warning("reply_email: failed to mark original as answered: %s", e)
+
+    saved = None
+    if save_to_sent:
+        saved = _save_to_sent_folder(msg)
+
+    return {
+        "status": "sent",
+        "reply_to": to_addr,
+        "cc": cc_addr,
+        "subject": reply_subject,
+        "in_reply_to": original_msg_id or None,
+        "attachments": attached_names,
+        "saved_to_sent": saved,
+    }
 
 
 if __name__ == "__main__":
